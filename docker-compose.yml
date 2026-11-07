@@ -1,0 +1,118 @@
+name: jarvis
+
+services:
+  jarvis:
+    image: jarvis:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jarvis
+    restart: unless-stopped
+    ports:
+      # Bind only the requested LAN and Tailscale interfaces.
+      - "${JARVIS_WEB_LAN_ADDRESS:-127.0.0.1}:5050:5050"
+      - "${JARVIS_WEB_TAILSCALE_ADDRESS:-127.0.0.1}:${JARVIS_WEB_TAILSCALE_PORT:-5051}:5050"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - PORT=5050
+      - JARVIS_WEB_HOST=0.0.0.0
+      - JARVIS_WEB_BIND_ADDRESSES=${JARVIS_WEB_BIND_ADDRESSES:-127.0.0.1,127.0.0.1}
+      - JARVIS_WEB_USERNAME=${JARVIS_WEB_USERNAME:-}
+      - JARVIS_WEB_PASSWORD=${JARVIS_WEB_PASSWORD:-}
+      - JARVIS_DOCKER_CONTROL_URL=http://docker-control:8765/api/control
+      - JARVIS_DOCKER_CONTROL_TOKEN=${JARVIS_DOCKER_CONTROL_TOKEN:-}
+      - JARVIS_IMMICH_LAN_URL=${JARVIS_IMMICH_LAN_URL:-http://10.1.1.6:2283}
+      - JARVIS_IMMICH_TAILSCALE_URL=${JARVIS_IMMICH_TAILSCALE_URL:-http://100.87.245.73:2283}
+      - JARVIS_LOG_DIR=/var/log/jarvis
+      - LLM_PROVIDER=ollama
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - LLM_CHAT_MODEL=qwen3:1.7b
+      - FAST_MODEL=qwen3:1.7b
+      - TOOL_SELECTION_STRATEGY=llm
+      - WHISPER_MODEL=base
+      - WHISPER_DEVICE=cpu
+      - TZ=America/Sao_Paulo
+    volumes:
+      - ./data:/root/.local/share/jarvis
+      - ./config:/root/.config/jarvis
+      - /mnt/sda1/jarvis/logs:/var/log/jarvis
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "2"
+    devices:
+      - /dev/snd:/dev/snd
+    networks:
+      - default
+      - docker_control
+    x-casaos:
+      architectures:
+        - amd64
+        - arm64
+      main: jarvis
+      description:
+        en_us: "Private local AI assistant with voice, memory, and CasaOS integration"
+        pt_br: "Assistente local privado de IA com voz, memória e integração com CasaOS"
+      developer: "isair"
+      icon: "https://raw.githubusercontent.com/isair/jarvis/main/docs/img/face.png"
+      title:
+        en_us: "Jarvis AI"
+        pt_br: "Jarvis AI"
+      index: "/"
+      port_map: "5050"
+      scheme: "http"
+      category: "AI"
+
+  docker-control:
+    profiles: ["container-control"]
+    build:
+      context: ./docker_control
+      dockerfile: Dockerfile
+    image: jarvis-docker-control:latest
+    container_name: jarvis-docker-control
+    restart: unless-stopped
+    environment:
+      - JARVIS_DOCKER_CONTROL_TOKEN=${JARVIS_DOCKER_CONTROL_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - docker_control
+    logging:
+      driver: local
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: jarvis
+  description:
+    en_us: "Private local AI assistant with voice, memory, and CasaOS integration"
+    pt_br: "Assistente local privado de IA com voz, memória e integração com CasaOS"
+  developer: "isair"
+  icon: "https://raw.githubusercontent.com/isair/jarvis/main/docs/img/face.png"
+  title:
+    en_us: "Jarvis AI"
+    pt_br: "Jarvis AI"
+  index: "/"
+  port_map: "5050"
+  scheme: "http"
+  category: "AI"
+
+networks:
+  docker_control:
+    internal: true

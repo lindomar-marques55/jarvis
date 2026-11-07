@@ -1,0 +1,180 @@
+"""
+Regression tests for the most-reported desktop crash (#503 and friends).
+
+When the PortAudio shared library is missing (common on Linux),
+``import sounddevice`` raises **OSError**, not ImportError. Similarly,
+``pynput`` can raise non-ImportError exceptions on headless Linux (no X
+display). Modules that treat audio as optional must survive both,
+otherwise the setup wizard's dictation page import chain kills the whole
+app at first launch.
+
+These tests import the modules in a subprocess where the dependency
+raises at import time, and assert the modules still load with the
+feature disabled (behaviour: app keeps running without audio).
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+
+SCENARIO = r"""
+import sys
+
+sys.path.insert(0, r"{src}")
+
+# Simulate a broken optional dependency raising at import time.
+class _Raiser:
+    def find_spec(self, name, path=None, target=None):
+        if name == "{dep}":
+            raise {error}
+        return None
+
+sys.modules.pop("{dep}", None)
+sys.meta_path.insert(0, _Raiser())
+
+import {module} as m
+assert getattr(m, "{attr}") is None, "{attr} should be None when {dep} is broken"
+
+{extra}
+print("OK")
+"""
+
+
+def _run(module: str, dep: str, error: str, attr: str, extra: str = "") -> subprocess.CompletedProcess:
+    code = SCENARIO.format(src=str(ROOT / "src"), module=module, dep=dep, error=error, attr=attr, extra=extra)
+    # The subprocess inherits the Windows console codepage (cp1252) by
+    # default, which cannot encode the emoji in listener.py's graceful
+    # PortAudio-failure message — force UTF-8 so the module actually reaches
+    # the "loads with the feature disabled" assertion instead of dying on print.
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    return subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        encoding="utf-8", timeout=60, env=env,
+    )
+
+
+def _assert_ok(result: subprocess.CompletedProcess) -> None:
+    assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    assert "OK" in result.stdout
+
+
+def test_dictation_engine_imports_without_portaudio():
+    """Dictation engine must load (audio disabled) when PortAudio is absent."""
+    extra = (
+        "from jarvis.dictation.dictation_engine import format_hotkey_display\n"
+        "assert format_hotkey_display('ctrl+alt')"
+    )
+    result = _run(
+        "jarvis.dictation.dictation_engine",
+        dep="sounddevice",
+        error='OSError("PortAudio library not found")',
+        attr="sd",
+        extra=extra,
+    )
+    _assert_ok(result)
+
+
+def test_dictation_engine_imports_with_broken_pynput():
+    """Dictation engine must load (hotkey disabled) when pynput fails to import."""
+    result = _run(
+        "jarvis.dictation.dictation_engine",
+        dep="pynput",
+        error='RuntimeError("no X display available")',
+        attr="pynput_keyboard",
+    )
+    _assert_ok(result)
+
+
+def test_listener_imports_without_portaudio():
+    """Voice listener module must load (audio disabled) when PortAudio is absent."""
+    result = _run(
+        "jarvis.listening.listener",
+        dep="sounddevice",
+        error='OSError("PortAudio library not found")',
+        attr="sd",
+    )
+    _assert_ok(result)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('error', [
+    'ImportError("fixture native binary blocked")',
+    'OSError("fixture shared library unavailable")',
+    'ValueError("fixture optional module metadata unavailable")',
+])
+@pytest.mark.parametrize('dependency', ['faster_whisper', 'sounddevice', 'webrtcvad', 'numpy'])
+def test_text_submission_survives_unavailable_speech_backend(error, dependency):
+    """An unavailable audio dependency cannot prevent a typed reply."""
+    extra = r'''
+import threading
+from unittest.mock import patch
+from jarvis.memory.conversation import DialogueMemory
+
+m._global_cfg = object()
+m._global_db = object()
+m._global_dialogue_memory = DialogueMemory(inactivity_timeout=300, max_interactions=20)
+completed = threading.Event()
+replies = []
+def complete(reply):
+    replies.append(reply)
+    completed.set()
+def text_engine(*, text, tts, **kwargs):
+    assert tts is None
+    return "Typed reply: " + text
+with patch('jarvis.reply.engine.run_reply_engine', text_engine):
+    m.submit_text_query('hello Jarvis', on_complete=complete)
+    assert completed.wait(5), 'Typed query never completed'
+assert replies == ['Typed reply: hello Jarvis'], replies
+'''
+    result = _run('jarvis.daemon', dep=dependency, error=error,
+                  attr='_global_db', extra=extra)
+    _assert_ok(result)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('error', [
+    'ImportError("fixture VAD native binary blocked")',
+    'OSError("fixture VAD shared library unavailable")',
+    'RuntimeError("fixture VAD initialisation unavailable")',
+])
+def test_listener_uses_energy_detection_when_optional_vad_cannot_import(error):
+    """Unavailable optional VAD preserves capture and rejects silent frames."""
+    extra = r'''
+from collections import deque
+from types import SimpleNamespace
+import numpy as np
+
+listener = m.VoiceListener.__new__(m.VoiceListener)
+listener.cfg = SimpleNamespace(voice_min_energy=0.02)
+listener._recent_audio_energy = deque(maxlen=20)
+listener._vad = None
+assert not listener._is_speech_frame(np.zeros(320, dtype=np.float32)), 'Silence accepted as speech'
+assert not listener._is_speech_frame(np.ones(320, dtype=np.float32) * listener.cfg.voice_min_energy / 2), 'Below-threshold noise accepted'
+assert listener._is_speech_frame(np.ones(320, dtype=np.float32) * listener.cfg.voice_min_energy * 2), 'Audible frame rejected'
+assert m.sd is not None, 'Optional VAD failure disabled microphone capture'
+'''
+    result = _run('jarvis.listening.listener', dep='webrtcvad', error=error,
+                  attr='webrtcvad', extra=extra)
+    _assert_ok(result)
+    assert 'PortAudio' not in result.stdout
+
+
+@pytest.mark.unit
+def test_listener_without_numpy_reports_unavailable_processing():
+    """Capture cannot run without its required array-processing dependency."""
+    extra = r'''
+listener = m.VoiceListener.__new__(m.VoiceListener)
+listener._run()
+'''
+    result = _run('jarvis.listening.listener', dep='numpy',
+                  error='ImportError("fixture array processing unavailable")',
+                  attr='np', extra=extra)
+    _assert_ok(result)
+    assert 'audio processing' in result.stdout.lower()
+    assert 'PortAudio' not in result.stdout

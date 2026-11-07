@@ -1,0 +1,421 @@
+"""Ollama HTTP transport for chat, native tools and embeddings.
+
+Chat requests use local Ollama endpoints, optional reasoning controls and
+prompt caching. Responses expose assistant content separately from reasoning.
+Timeouts and unavailable services fail softly; unsupported native tools raise
+``ToolsNotSupportedError`` for the reply engine's text-based fallback.
+"""
+
+from __future__ import annotations
+from typing import Any, Callable, Dict, List, Optional
+
+import json
+import time
+import requests
+
+from ..debug import debug_log
+from . import http
+from .errors import is_timeout_error
+from .streaming import check_stream_deadline, iter_stream_lines
+from .backend import (
+    LLMBackend, ToolsNotSupportedError, response_is_incomplete,
+    strip_nonstandard_message_fields,
+)
+
+
+def check_version(base_url: str, timeout: float = 5.0) -> tuple[bool, str | None]:
+    """Probe ``GET /api/version`` and return ``(True, version_str)`` if the
+    endpoint responds as an Ollama server, or ``(False, None)`` on failure or
+    non-Ollama response."""
+    try:
+        with http.get(f"{base_url}/api/version", timeout=timeout) as resp:
+            if resp.status_code != 200:
+                return False, None
+            data = resp.json()
+            if not isinstance(data, dict):
+                return False, None
+            version = data.get("version")
+            if not isinstance(version, str) or not version:
+                return False, None
+            return True, version
+    except Exception:
+        return False, None
+
+
+def extract_text_from_response(data: Dict[str, Any]) -> Optional[str]:
+    """Extract text from an LLM chat response across known shapes.
+
+    Handles Ollama's ``message.content`` shape and the OpenAI-style
+    ``choices[0].message.content`` / ``choices[0].text`` fallbacks so
+    callers do not need to special-case responses that come back from
+    OpenAI-compatible runtimes proxied through Ollama.
+    """
+    if "message" in data and isinstance(data["message"], dict):
+        content = data["message"].get("content")
+        if isinstance(content, str):
+            return content
+
+    if "choices" in data and isinstance(data["choices"], list) and len(data["choices"]) > 0:
+        choice = data["choices"][0]
+        if isinstance(choice, dict):
+            if "message" in choice and isinstance(choice["message"], dict):
+                content = choice["message"].get("content")
+                if isinstance(content, str):
+                    return content
+            elif "text" in choice:
+                content = choice["text"]
+                if isinstance(content, str):
+                    return content
+
+    if "content" in data:
+        content = data["content"]
+        if isinstance(content, str):
+            return content
+
+    return None
+
+
+def _thinking_level(chat_model: str, thinking: bool | str) -> bool | str:
+    """Translate boolean controls to GPT-OSS's supported reasoning levels."""
+    model_name = chat_model.rsplit("/", 1)[-1].partition(":")[0]
+    if model_name.casefold() == "gpt-oss" and isinstance(thinking, bool):
+        level = "high" if thinking else "low"
+        debug_log(f"GPT-OSS reasoning level: {level}", "llm")
+        return level
+    return thinking
+
+
+class OllamaBackend(LLMBackend):
+    """:class:`LLMBackend` implementation that talks to a local Ollama server."""
+
+    def __init__(self, base_url: str) -> None:
+        self._base_url = base_url.rstrip("/")
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    # ── chat ───────────────────────────────────────────────────────────
+
+    def direct(
+        self,
+        chat_model: str,
+        system_prompt: str,
+        user_content: str,
+        timeout_sec: float = 10.0,
+        thinking: bool = False,
+        num_ctx: int = 4096,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Optional[str]:
+        """Direct LLM call without temporal context, location, or other
+        ``ask_coach`` features.
+
+        ``num_ctx`` controls Ollama's context window for this call.
+        Default 4096 is fine for small classification-shaped passes;
+        callers that assemble richer prompts (planner with dialogue +
+        memory + tool catalogue) should pass a larger value to avoid
+        silent truncation.
+
+        ``temperature`` is forwarded to Ollama when set. Pass ``0.0``
+        for classification / extraction calls where determinism beats
+        creativity — Ollama defaults to ~0.8 otherwise, which can
+        flake small models on rule-following tasks (e.g. the knowledge
+        extractor's banned-form list).
+
+        ``max_tokens`` maps to Ollama's ``num_predict``, capping the
+        total generated tokens (including reasoning). Essential for
+        classification calls where small reasoning models otherwise
+        loop endlessly.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        options: Dict[str, Any] = {"num_ctx": num_ctx}
+        if temperature is not None:
+            options["temperature"] = temperature
+        if max_tokens is not None:
+            options["num_predict"] = max_tokens
+
+        payload: Dict[str, Any] = {
+            "model": chat_model,
+            "messages": messages,
+            "stream": False,
+            "cache_prompt": True,
+            "options": options,
+            "think": _thinking_level(chat_model, thinking),
+        }
+
+        try:
+            with http.post(
+                f"{self._base_url}/api/chat", json=payload, timeout=timeout_sec
+            ) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+
+            if isinstance(data, dict):
+                if response_is_incomplete(data):
+                    debug_log("OllamaBackend.direct: incomplete generation", "llm")
+                    return None
+                content = extract_text_from_response(data)
+                if isinstance(content, str) and content.strip():
+                    return content
+                debug_log(
+                    f"OllamaBackend.direct: empty content from response keys={list(data.keys())}",
+                    "llm",
+                )
+        except requests.exceptions.Timeout:
+            debug_log(f"OllamaBackend.direct: timeout after {timeout_sec}s", "llm")
+            return None
+        except Exception as e:
+            debug_log(f"OllamaBackend.direct: request failed ({type(e).__name__})", "llm")
+            return None
+
+        return None
+
+    def streaming(
+        self,
+        chat_model: str,
+        system_prompt: str,
+        user_content: str,
+        on_token: Optional[Callable[[str], None]] = None,
+        timeout_sec: float = 30.0,
+        thinking: bool = False,
+    ) -> Optional[str]:
+        """Streaming LLM call that invokes ``on_token`` for each token
+        received. Returns the complete response text, or ``None`` on
+        error / empty stream.
+
+        Uses ``with http.post(...)`` so the streaming response (and
+        the underlying TCP connection) is released even if iteration
+        exits early via an exception or the caller stops consuming.
+        Without this, an aborted stream pinned the connection until GC,
+        which could happen many turns later under sustained reply
+        load.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        payload: Dict[str, Any] = {
+            "model": chat_model,
+            "messages": messages,
+            "stream": True,
+            "cache_prompt": True,
+            "options": {"num_ctx": 4096},
+            "think": _thinking_level(chat_model, thinking),
+        }
+
+        deadline = time.monotonic() + timeout_sec
+        try:
+            with http.post(
+                f"{self._base_url}/api/chat",
+                json=payload,
+                timeout=timeout_sec,
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+
+                full_response: List[str] = []
+                for line in iter_stream_lines(resp, deadline):
+                    if line:
+                        try:
+                            data = json.loads(line)
+                            if "message" in data and isinstance(data["message"], dict):
+                                content = data["message"].get("content", "")
+                                if content:
+                                    full_response.append(content)
+                                    if on_token:
+                                        on_token(content)
+                        except json.JSONDecodeError:
+                            continue
+
+                check_stream_deadline(deadline)
+                result = "".join(full_response)
+                return result if result.strip() else None
+
+        except requests.exceptions.Timeout:
+            debug_log(f"ollama streaming: timeout after {timeout_sec}s", "llm")
+            return None
+        except Exception:
+            return None
+
+    def chat(
+        self,
+        chat_model: str,
+        messages: List[Dict[str, Any]],
+        timeout_sec: float = 30.0,
+        extra_options: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        thinking: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Send an arbitrary messages array to Ollama and return the
+        raw response JSON. Caller is responsible for interpreting
+        assistant content (including JSON / tool calls).
+
+        Main agentic chat uses ``num_ctx=8192`` so the system prompt
+        (tool list + protocol guidance + memory context) does not
+        overflow and force Ollama to truncate the tool schema — small
+        models like ``gemma4:e2b`` then fall back to pre-trained
+        ``tool_code`` scaffolding instead of producing valid tool calls.
+        """
+        sanitised = strip_nonstandard_message_fields(messages)
+        payload: Dict[str, Any] = {
+            "model": chat_model,
+            "messages": sanitised,
+            "stream": False,
+            "cache_prompt": True,
+            "options": {"num_ctx": 8192},
+            "think": thinking,
+        }
+        # ``extra_options`` keys land at the Ollama wire root for known
+        # request-level fields (``keep_alive``, ``format``, ``think``); the
+        # rest fold into the sampling-options dict. The split lets callers
+        # pin per-request keep-alive without learning Ollama's wire shape.
+        # ``max_tokens`` is the canonical generation cap across backends —
+        # translate it to Ollama's ``num_predict`` so callers don't need to
+        # know which knob each server speaks.
+        if extra_options and isinstance(extra_options, dict):
+            for key, value in extra_options.items():
+                if key in {"keep_alive", "format", "think"}:
+                    payload[key] = value
+                elif key == "max_tokens":
+                    payload["options"]["num_predict"] = int(value)
+                elif key == "options" and isinstance(value, dict):
+                    for inner_key, inner_value in value.items():
+                        if inner_key == "max_tokens":
+                            payload["options"]["num_predict"] = int(inner_value)
+                        else:
+                            payload["options"][inner_key] = inner_value
+                else:
+                    payload["options"][key] = value
+
+        payload["think"] = _thinking_level(chat_model, payload["think"])
+
+        if tools and isinstance(tools, list) and len(tools) > 0:
+            payload["tools"] = tools
+
+        try:
+            with http.post(
+                f"{self._base_url}/api/chat", json=payload, timeout=timeout_sec
+            ) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+            if isinstance(data, dict):
+                return data
+        except requests.exceptions.Timeout:
+            print(f"  ⏱️ LLM request timed out (configured timeout: {timeout_sec:g}s)", flush=True)
+            return None
+        except requests.exceptions.ConnectionError as exc:
+            if is_timeout_error(exc):
+                debug_log("chat response read timed out (wrapped transport timeout)", "llm")
+                print(f"  ⏱️ LLM request timed out (configured timeout: {timeout_sec:g}s)", flush=True)
+                return None
+            # Bubble out so callers (e.g. the intent judge) can distinguish
+            # "server unreachable" from a transient error and apply their own
+            # back-off policy.
+            print("  ❌ LLM connection error", flush=True)
+            raise
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400 and tools:
+                raise ToolsNotSupportedError(
+                    f"Model {chat_model!r} returned HTTP 400 — native tools API not supported"
+                )
+            status = e.response.status_code if e.response is not None else "?"
+            print(f"  ❌ LLM HTTP error (status {status})", flush=True)
+            return None
+        except Exception as e:
+            print(f"  ❌ LLM error ({type(e).__name__})", flush=True)
+            return None
+
+        return None
+
+    # ── embeddings & discovery ────────────────────────────────────────
+
+    def embed(
+        self,
+        text: str,
+        model: str,
+        timeout_sec: float = 15.0,
+    ) -> Optional[List[float]]:
+        """Embed ``text`` via Ollama's ``/api/embeddings``."""
+        try:
+            with http.post(
+                f"{self._base_url}/api/embeddings",
+                json={"model": model, "prompt": text},
+                timeout=timeout_sec,
+            ) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+                vec = data.get("embedding")
+                if isinstance(vec, list):
+                    return [float(x) for x in vec]
+        except Exception:
+            return None
+        return None
+
+    def list_models(self, timeout_sec: float = 5.0) -> List[str]:
+        """List installed Ollama models via ``GET /api/tags``."""
+        try:
+            with http.get(f"{self._base_url}/api/tags", timeout=timeout_sec) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+                models = data.get("models", []) if isinstance(data, dict) else []
+                names: List[str] = []
+                for m in models:
+                    if isinstance(m, dict):
+                        name = m.get("name")
+                        if isinstance(name, str) and name:
+                            names.append(name)
+                return names
+        except Exception:
+            return []
+
+    def warm_up(
+        self,
+        model: str,
+        timeout_sec: float = 60.0,
+        keep_alive: str = "30m",
+    ) -> bool:
+        """Probe ``/api/version`` to verify the server is Ollama, then issue a
+        minimal ``/api/chat`` request so it loads ``model`` into resident memory
+        for the requested ``keep_alive`` duration. The chat-endpoint warmup
+        exercises the full inference pipeline (JIT compilation, KV-cache
+        allocation) that an empty ``/api/generate`` would not trigger,
+        preventing a timeout on the first real intent-judge or reply-engine
+        call. ``keep_alive`` is caller-supplied so low power mode can ask for a
+        short residency instead of holding the model for half an hour.
+        Best-effort: errors are swallowed so callers never crash on warmup
+        failure."""
+        if not self._base_url or not model:
+            return False
+        try:
+            # Verify the server is actually Ollama before warming up —
+            # a non-Ollama HTTP server on the same port could return 200
+            # to a chat POST and produce a false positive.
+            version_to = min(timeout_sec, 5.0)
+            ok, _ = check_version(self._base_url, timeout=version_to)
+            if not ok:
+                return False
+
+            remaining = max(1.0, timeout_sec - version_to)
+            with http.post(
+                f"{self._base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "ping"},
+                    ],
+                    "stream": False,
+                    "keep_alive": keep_alive,
+                    "options": {"num_predict": 1, "temperature": 0.0},
+                },
+                timeout=remaining,
+            ) as resp:
+                return resp.status_code == 200
+        except Exception:
+            return False

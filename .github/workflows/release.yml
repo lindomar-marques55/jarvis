@@ -1,0 +1,333 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    # Dispatched by release-smoke.yml after it fast-forwards main: GitHub
+    # does not fire on:push workflows for pushes made with GITHUB_TOKEN, so
+    # the release would otherwise never be published automatically.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'develop' && github.run_id || 'stable' }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Semantic versioning analysis (main only) ────────────────────────────
+  semantic-release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      new_release_published: ${{ steps.semantic.outputs.new_release_published }}
+      new_release_version: ${{ steps.semantic.outputs.new_release_version }}
+      new_release_git_tag: ${{ steps.semantic.outputs.new_release_git_tag }}
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: 📦 Install semantic-release
+        run: |
+          npm install -g semantic-release@22 \
+            @semantic-release/github@9 \
+            conventional-changelog-conventionalcommits@7
+
+      - name: 🧪 Verify staged release publication
+        run: node tests/release_publication.mjs "$(npm root -g)/@semantic-release/github"
+
+      - name: 🏷️ Semantic Release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release_status=0
+          npx semantic-release --debug > release_output.log 2>&1 || release_status=$?
+          cat release_output.log
+          if [ "$release_status" -ne 0 ]; then
+            exit "$release_status"
+          fi
+
+          if grep -q "Published release" release_output.log; then
+            echo "new_release_published=true" >> $GITHUB_OUTPUT
+            VERSION=$(grep "Published release" release_output.log | sed -nE 's/.*Published release ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
+            echo "new_release_version=$VERSION" >> $GITHUB_OUTPUT
+            echo "new_release_git_tag=v$VERSION" >> $GITHUB_OUTPUT
+            echo "✅ Released version $VERSION"
+          else
+            echo "new_release_published=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No release created (no releasable changes found)"
+          fi
+
+  desktop-changes:
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      required: ${{ steps.changes.outputs.required }}
+    steps:
+      - name: 📥 Checkout complete history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 🔎 Check installer changes
+        id: changes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: python3 scripts/desktop_release_changes.py
+
+  # Only qualifying builds share cancellation; test-only runs cannot interrupt them.
+  build-desktop:
+    needs: [desktop-changes]
+    if: github.ref == 'refs/heads/develop' && needs.desktop-changes.outputs.required == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-develop-build
+      cancel-in-progress: true
+    uses: ./.github/workflows/build-desktop.yml
+    with:
+      version: dev-${{ github.sha }}
+      channel: develop
+      smoke_test: false
+
+  # ── Build stable-stamped desktop apps (main only) ───────────────────────
+  # The version isn't known until semantic-release runs on main, so the
+  # smoke-tested artifacts (built as dev/develop before the fast-forward)
+  # can't be published as the stable release — they would stamp stable
+  # installs onto the develop channel and get them offered develop builds.
+  # Rebuild the same (already smoke-tested) commit with the real version so
+  # stable installs report channel "stable" and only see stable updates.
+  build-stable:
+    needs: [semantic-release]
+    if: always() && needs.semantic-release.result == 'success' && needs.semantic-release.outputs.new_release_published == 'true'
+    uses: ./.github/workflows/build-desktop.yml
+    with:
+      version: ${{ needs.semantic-release.outputs.new_release_version }}
+      channel: stable
+      smoke_test: false
+
+  # ── Create versioned GitHub release (main only, from stable-stamped builds) ─
+  release-main:
+    needs: [semantic-release, build-stable]
+    runs-on: ubuntu-latest
+    if: always() && needs.semantic-release.result == 'success' && needs.semantic-release.outputs.new_release_published == 'true'
+
+    permissions:
+      contents: write
+      actions: read  # gh run download reads this run's artifacts
+
+    steps:
+      - name: 📥 Download artifacts from build-stable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Download every platform artifact that build-stable produced in
+          # this run. Fail loudly if any are missing — publishing a release
+          # without its binaries is worse than a failed job.
+          set -euo pipefail
+          missing=0
+          for name in Jarvis-Windows Jarvis-macOS-arm64 Jarvis-macOS-x64 Jarvis-Linux; do
+            echo "Downloading $name..."
+            if ! gh run download ${{ github.run_id }} --repo ${{ github.repository }} \
+              --name "$name" \
+              --dir artifacts; then
+              echo "::error::Missing artifact $name"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::One or more build artifacts are missing; not publishing a release without binaries."
+            exit 1
+          fi
+
+      - name: 📋 List available artifacts
+        run: |
+          echo "Available artifacts:"
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | sort || echo "(none)"
+
+      - name: 📎 Attach binaries to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.semantic-release.outputs.new_release_git_tag }}
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+          fail_on_unmatched_files: false
+          append_body: true
+          body: |
+
+            ---
+
+            ### ⚡ Prerequisites
+            - [Ollama](https://ollama.com/download) (default), or any OpenAI-compatible server (LM Studio, Jan, llama.cpp, vLLM, oMLX, LocalAI, …)
+
+            ### 📦 Downloads
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | **Windows** | `Jarvis-Windows-x64.zip` | Extract → Run `Jarvis.exe` |
+            | **macOS (Apple Silicon)** | `Jarvis-macOS-arm64.zip` | Extract → Move to Applications → Right-click → Open |
+            | **macOS (Intel)** | `Jarvis-macOS-x64.zip` | Extract → Move to Applications → Right-click → Open |
+            | **Linux** | `Jarvis-Linux-x64.tar.gz` | `tar -xzf` → Run `./Jarvis/Jarvis` |
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🧭 Mirror stable build to the develop "latest" channel
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Serve the stable build through the "latest" (develop) channel so
+          # develop builds, and installs mis-stamped as develop (e.g. v2.2.1),
+          # can update to stable through their normal update flow. The next
+          # develop push re-publishes "latest" with a fresh develop build, so
+          # the window closes by itself.
+          FILES=$(find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | tr '\n' ' ')
+          if [ -z "$FILES" ]; then
+            echo "::warning::No artifacts to mirror to 'latest'"
+            exit 0
+          fi
+          gh release upload latest $FILES --clobber --repo ${{ github.repository }}
+
+  # ── Create/update "latest" pre-release (develop only) ──────────────────
+  release-develop:
+    needs: [build-desktop]
+    runs-on: ubuntu-latest
+    if: always() && github.ref == 'refs/heads/develop' && needs.build-desktop.result == 'success'
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 📝 Generate changelog from main
+        id: changelog
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 origin/main 2>/dev/null || echo "")
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No tags found, using full develop history"
+            COMPARE_REF="origin/main"
+            SINCE_TEXT="main branch"
+          else
+            COMPARE_REF="$LATEST_TAG"
+            SINCE_TEXT="$LATEST_TAG"
+          fi
+
+          echo "Generating changelog comparing to: $COMPARE_REF"
+
+          {
+            echo "CHANGELOG<<CHANGELOG_EOF"
+            echo ""
+            echo "## 📋 Changelog (since $SINCE_TEXT)"
+            echo ""
+
+            FEATURES=$(git log "$COMPARE_REF"..HEAD --pretty=format:"* %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^feat" --regexp-ignore-case 2>/dev/null || true)
+            if [ -n "$FEATURES" ]; then
+              echo "### ✨ Features"
+              echo ""
+              echo "$FEATURES"
+              echo ""
+            fi
+
+            FIXES=$(git log "$COMPARE_REF"..HEAD --pretty=format:"* %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^fix" --regexp-ignore-case 2>/dev/null || true)
+            if [ -n "$FIXES" ]; then
+              echo "### 🐛 Bug Fixes"
+              echo ""
+              echo "$FIXES"
+              echo ""
+            fi
+
+            REFACTOR=$(git log "$COMPARE_REF"..HEAD --pretty=format:"* %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^refactor" --regexp-ignore-case 2>/dev/null || true)
+            if [ -n "$REFACTOR" ]; then
+              echo "### ♻️ Code Refactoring"
+              echo ""
+              echo "$REFACTOR"
+              echo ""
+            fi
+
+            DOCS=$(git log "$COMPARE_REF"..HEAD --pretty=format:"* %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" --grep="^docs" --regexp-ignore-case 2>/dev/null || true)
+            if [ -n "$DOCS" ]; then
+              echo "### 📝 Documentation"
+              echo ""
+              echo "$DOCS"
+              echo ""
+            fi
+
+            OTHER=$(git log "$COMPARE_REF"..HEAD --pretty=format:"%s|%h|%H" 2>/dev/null | grep -v -i -E "^(feat|fix|refactor|docs)" | while IFS='|' read -r subject short full; do
+              if [ -n "$subject" ]; then
+                echo "* $subject ([$short](https://github.com/${{ github.repository }}/commit/$full))"
+              fi
+            done || true)
+            if [ -n "$OTHER" ]; then
+              echo "### 🔧 Other Changes"
+              echo ""
+              echo "$OTHER"
+              echo ""
+            fi
+
+            echo "CHANGELOG_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: 📥 Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: 📋 List available artifacts
+        run: |
+          echo "Available artifacts:"
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | sort || echo "(none)"
+
+      - name: 📝 Create/Update Latest Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: Latest Development Build
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+          fail_on_unmatched_files: false
+          draft: false
+          prerelease: true
+          body: |
+            🚀 **Latest development build from develop branch**
+
+            This is an automated build from the latest commit on develop.
+            These builds may be unstable. For stable releases, use versioned releases.
+
+            ---
+            ${{ steps.changelog.outputs.CHANGELOG }}
+            ---
+
+            ### ⚡ Prerequisites
+            - [Ollama](https://ollama.com/download) (default), or any OpenAI-compatible server (LM Studio, Jan, llama.cpp, vLLM, oMLX, LocalAI, …)
+
+            ### 📦 Downloads
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | **Windows** | `Jarvis-Windows-x64.zip` | Extract → Run `Jarvis.exe` |
+            | **macOS (Apple Silicon)** | `Jarvis-macOS-arm64.zip` | Extract → Move to Applications → Right-click → Open |
+            | **macOS (Intel)** | `Jarvis-macOS-x64.zip` | Extract → Move to Applications → Right-click → Open |
+            | **Linux** | `Jarvis-Linux-x64.tar.gz` | `tar -xzf` → Run `./Jarvis/Jarvis` |
+
+            **Branch**: develop
+            **Commit**: ${{ github.sha }}
+            **Date**: ${{ github.event.head_commit.timestamp }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

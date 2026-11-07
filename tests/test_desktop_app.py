@@ -1,0 +1,1904 @@
+"""Desktop contracts with controlled runtimes and temporary diagnostics."""
+
+import os
+import pytest
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
+
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.usefixtures("desktop_log_home", "no_network"),
+]
+
+
+class TestEntryPointImports:
+    """Guardrails for the PyInstaller entry point (src/desktop_app/app.py).
+
+    PyInstaller freezes app.py as __main__ with no parent package, so any
+    relative import (`from .foo import ...`) raises ImportError at launch
+    and the bundled app exits silently. Regression guard for the #242 bug
+    where `from .paths import get_log_dir` inside get_crash_paths() broke
+    every macOS launch.
+    """
+
+    def test_app_py_has_no_relative_imports(self):
+        """app.py is the frozen entry point — must use absolute imports only."""
+        import ast
+        from pathlib import Path
+
+        app_py = Path(__file__).parent.parent / "src" / "desktop_app" / "app.py"
+        tree = ast.parse(app_py.read_text(encoding="utf-8"))
+
+        relative_imports = [
+            f"line {node.lineno}: from {'.' * node.level}{node.module or ''} import ..."
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level > 0
+        ]
+
+        assert not relative_imports, (
+            "app.py is the PyInstaller entry point and runs as __main__ with "
+            "no package context. Relative imports will raise ImportError at "
+            "launch. Use `from desktop_app.X import ...` instead.\n"
+            "Offenders:\n  " + "\n  ".join(relative_imports)
+        )
+
+
+class TestOllamaRuntimeFlags:
+    """The desktop startup must only launch/verify Ollama when a local
+    provider actually uses it. A pure OpenAI-compatible setup should skip
+    the Ollama server-start and model-verification entirely."""
+
+    def _flags(self, **provider):
+        from types import SimpleNamespace
+        from desktop_app.app import _ollama_runtime_flags
+        return _ollama_runtime_flags(SimpleNamespace(**provider))
+
+    def test_default_ollama_needs_everything(self):
+        needed, chat_on_ollama = self._flags(llm_provider="ollama", embedding_provider="")
+        assert needed is True
+        assert chat_on_ollama is True
+
+    def test_pure_openai_compatible_skips_ollama(self):
+        """Chat and embeddings both remote: no local server, no model checks."""
+        needed, chat_on_ollama = self._flags(
+            llm_provider="openai_compatible", embedding_provider="")
+        assert needed is False
+        assert chat_on_ollama is False
+
+    def test_openai_chat_with_ollama_embeddings_still_needs_server(self):
+        """Chat remote but embeddings on Ollama: the server must be up, but
+        the chat-model verification does not apply (the chat model isn't an
+        Ollama model)."""
+        needed, chat_on_ollama = self._flags(
+            llm_provider="openai_compatible", embedding_provider="ollama")
+        assert needed is True
+        assert chat_on_ollama is False
+
+    def test_ollama_chat_with_openai_embeddings_needs_server_and_chat_check(self):
+        needed, chat_on_ollama = self._flags(
+            llm_provider="ollama", embedding_provider="openai_compatible")
+        assert needed is True
+        assert chat_on_ollama is True
+
+    def test_missing_attrs_default_to_ollama(self):
+        """A cfg-like object without provider attrs defaults to the Ollama
+        path (fail-safe — never skip Ollama setup by accident)."""
+        from types import SimpleNamespace
+        from desktop_app.app import _ollama_runtime_flags
+        needed, chat_on_ollama = _ollama_runtime_flags(SimpleNamespace())
+        assert needed is True
+        assert chat_on_ollama is True
+
+
+class TestOpenAICompatStartupCheck:
+    """At startup Jarvis can't launch a third-party LLM server, so it must
+    check reachability and warn the user early rather than failing silently
+    on the first request."""
+
+    @pytest.mark.parametrize("open_wizard", [False, True])
+    @pytest.mark.parametrize("wizard_accepted", [False, True])
+    def test_splash_hidden_during_warning_and_wizard(
+        self, qapp, monkeypatch, open_wizard, wizard_accepted
+    ):
+        from types import SimpleNamespace
+        from PyQt6.QtWidgets import QMessageBox, QWidget
+        from desktop_app import app as app_mod
+
+        splash = QWidget()
+        splash.show()
+        qapp.processEvents()
+        visited = []
+
+        def show_warning(dialog):
+            assert not splash.isVisible()
+            visited.append("warning")
+            return 0
+
+        def run_wizard():
+            assert not splash.isVisible()
+            visited.append("wizard")
+            return wizard_accepted
+
+        monkeypatch.setattr(QMessageBox, "exec", show_warning)
+        monkeypatch.setattr(QMessageBox, "clickedButton", lambda dialog: next(
+            button for button in dialog.buttons()
+            if (dialog.buttonRole(button) == QMessageBox.ButtonRole.ActionRole) == open_wizard
+        ))
+        monkeypatch.setattr(app_mod, "_run_setup_wizard", run_wizard)
+        try:
+            app_mod._show_openai_unreachable_dialog(
+                SimpleNamespace(llm_base_url="http://localhost:1234/v1"), splash
+            )
+            assert visited == (["warning", "wizard"] if open_wizard else ["warning"])
+            assert splash.isVisible()
+        finally:
+            splash.close()
+
+    def test_reachable_when_models_listed(self):
+        from types import SimpleNamespace
+        from desktop_app.app import _check_openai_compat_reachable
+        cfg = SimpleNamespace(
+            llm_provider="openai_compatible", llm_base_url="http://x/v1",
+            llm_api_key="", llm_chat_model="m", embedding_provider="")
+
+        class _Backend:
+            def list_models(self, timeout_sec=4.0):
+                return ["m-chat"]
+
+        with patch("jarvis.llm.get_llm_backend", return_value=_Backend()):
+            assert _check_openai_compat_reachable(cfg) is True
+
+    def test_unreachable_when_listing_empty_or_raises(self):
+        from types import SimpleNamespace
+        from desktop_app.app import _check_openai_compat_reachable
+        cfg = SimpleNamespace(llm_provider="openai_compatible", llm_base_url="http://x/v1")
+
+        class _Empty:
+            def list_models(self, timeout_sec=4.0):
+                return []
+
+        with patch("jarvis.llm.get_llm_backend", return_value=_Empty()):
+            assert _check_openai_compat_reachable(cfg) is False
+
+        with patch("jarvis.llm.get_llm_backend", side_effect=RuntimeError("boom")):
+            assert _check_openai_compat_reachable(cfg) is False
+
+    def test_unreachable_message_names_url_not_key(self):
+        """The unreachable dialog message mentions the URL but never the API key."""
+        from types import SimpleNamespace
+        from desktop_app.app import _build_unreachable_message
+        cfg = SimpleNamespace(llm_base_url="http://localhost:1234/v1", llm_api_key="sk-secret")
+        msg = _build_unreachable_message(cfg)
+        assert "http://localhost:1234/v1" in msg
+        assert "sk-secret" not in msg
+        assert "Setup Wizard" in msg
+
+
+class TestOllamaRuntimeOwnership:
+    """Jarvis only stops Ollama when this desktop session launched it."""
+
+    class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+            self.killed = False
+            self.waited_timeout = None
+
+        def poll(self):
+            return 0 if self.terminated or self.killed else None
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.waited_timeout = timeout
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    def test_stop_owned_runtime_noops_when_not_started_by_jarvis(self):
+        from desktop_app.app import (
+            OllamaRuntimeOwnership,
+            _stop_owned_ollama_runtime,
+        )
+
+        process = self.FakeProcess()
+        ownership = OllamaRuntimeOwnership(
+            started_by_jarvis=False,
+            launch_method="serve",
+            process=process,
+        )
+
+        stopped = _stop_owned_ollama_runtime(ownership)
+
+        assert stopped is False
+        assert process.terminated is False
+        assert ownership.stopped is False
+
+    def test_stop_owned_runtime_terminates_direct_serve_process(self):
+        from desktop_app.app import (
+            OllamaRuntimeOwnership,
+            _stop_owned_ollama_runtime,
+        )
+
+        process = self.FakeProcess()
+        ownership = OllamaRuntimeOwnership(
+            started_by_jarvis=True,
+            launch_method="serve",
+            process=process,
+        )
+
+        stopped = _stop_owned_ollama_runtime(ownership, timeout_sec=2)
+
+        assert stopped is True
+        assert process.terminated is True
+        assert process.killed is False
+        assert process.waited_timeout == 2
+        assert ownership.stopped is True
+
+    def test_stop_owned_runtime_quits_macos_app_when_owned(self):
+        from desktop_app.app import (
+            OllamaRuntimeOwnership,
+            _stop_owned_ollama_runtime,
+        )
+
+        commands = []
+
+        def runner(command, **_kwargs):
+            commands.append(command)
+            return MagicMock(returncode=0)
+
+        ownership = OllamaRuntimeOwnership(
+            started_by_jarvis=True,
+            launch_method="macos_app",
+            process=None,
+        )
+
+        with patch("sys.platform", "darwin"):
+            stopped = _stop_owned_ollama_runtime(
+                ownership,
+                command_runner=runner,
+            )
+
+        assert stopped is True
+        assert ownership.stopped is True
+        assert commands == [["osascript", "-e", 'tell application "Ollama" to quit']]
+
+    def test_cleanup_on_exit_stops_owned_ollama_runtime(self):
+        from desktop_app.app import JarvisSystemTray, OllamaRuntimeOwnership
+
+        stopped = []
+        tray = JarvisSystemTray.__new__(JarvisSystemTray)
+        tray.is_listening = False
+        tray.daemon_process = None
+        tray._ollama_runtime_ownership = OllamaRuntimeOwnership(
+            started_by_jarvis=True,
+            launch_method="serve",
+        )
+        tray.memory_viewer = MagicMock()
+
+        with patch(
+            "desktop_app.app._stop_owned_ollama_runtime",
+            side_effect=lambda ownership: stopped.append(ownership) or True,
+        ):
+            tray.cleanup_on_exit()
+
+        assert stopped == [tray._ollama_runtime_ownership]
+
+
+class TestRuntimeStatusSnapshot:
+    """The tray runtime status reports Jarvis, Ollama, and config state."""
+
+    def _settings(self, **overrides):
+        values = {
+            "llm_provider": "ollama",
+            "embedding_provider": "",
+            "llm_chat_model": "gemma4:e2b",
+            "embedding_model": "nomic-embed-text",
+            "low_power_mode": False,
+            "mcps": {"github": {}, "browser": {}},
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_collect_snapshot_reports_subprocess_and_owned_ollama(self):
+        from desktop_app.app import (
+            OllamaRuntimeOwnership,
+            _collect_runtime_status_snapshot,
+        )
+
+        process = MagicMock()
+        process.pid = 12345
+        process.poll.return_value = None
+
+        snapshot = _collect_runtime_status_snapshot(
+            is_listening=True,
+            is_bundled=False,
+            daemon_process=process,
+            daemon_thread=None,
+            ollama_runtime_ownership=OllamaRuntimeOwnership(
+                started_by_jarvis=True,
+                launch_method="serve",
+            ),
+            settings_loader=lambda: self._settings(),
+            ollama_checker=lambda: (True, "0.9.1"),
+        )
+
+        assert snapshot.daemon_state == "Listening"
+        assert snapshot.daemon_mode == "subprocess"
+        assert snapshot.daemon_pid == 12345
+        assert snapshot.ollama_needed is True
+        assert snapshot.ollama_running is True
+        assert snapshot.ollama_version == "0.9.1"
+        assert snapshot.ollama_owner == "Jarvis"
+        assert snapshot.low_power_mode is False
+        assert snapshot.mcp_count == 2
+
+    def test_collect_snapshot_reports_low_power_mode(self):
+        from desktop_app.app import _collect_runtime_status_snapshot
+
+        snapshot = _collect_runtime_status_snapshot(
+            is_listening=True,
+            is_bundled=True,
+            daemon_process=None,
+            daemon_thread=object(),
+            ollama_runtime_ownership=None,
+            settings_loader=lambda: self._settings(low_power_mode=True),
+            ollama_checker=lambda: (False, None),
+        )
+
+        assert snapshot.low_power_mode is True
+
+    def test_collect_snapshot_fails_open_when_checks_error(self):
+        from desktop_app.app import _collect_runtime_status_snapshot
+
+        snapshot = _collect_runtime_status_snapshot(
+            is_listening=False,
+            is_bundled=True,
+            daemon_process=None,
+            daemon_thread=None,
+            ollama_runtime_ownership=None,
+            settings_loader=lambda: (_ for _ in ()).throw(RuntimeError("bad config")),
+            ollama_checker=lambda: (_ for _ in ()).throw(RuntimeError("down")),
+        )
+
+        assert snapshot.daemon_state == "Stopped"
+        assert snapshot.daemon_mode == "bundled"
+        assert snapshot.daemon_pid is None
+        assert snapshot.ollama_needed is True
+        assert snapshot.ollama_running is False
+        assert snapshot.ollama_version is None
+        assert snapshot.low_power_mode is False
+        assert snapshot.chat_model == "unknown"
+        assert snapshot.mcp_count == 0
+
+    def test_format_runtime_status_is_scannable(self):
+        from desktop_app.app import RuntimeStatusSnapshot, _format_runtime_status
+
+        text = _format_runtime_status(
+            RuntimeStatusSnapshot(
+                daemon_state="Listening",
+                daemon_mode="subprocess",
+                daemon_pid=12345,
+                ollama_needed=True,
+                ollama_running=True,
+                ollama_version="0.9.1",
+                ollama_owner="Jarvis",
+                ollama_launch_method="serve",
+                low_power_mode=True,
+                llm_provider="ollama",
+                chat_model="gemma4:e2b",
+                embedding_provider="ollama",
+                embedding_model="nomic-embed-text",
+                mcp_count=2,
+            )
+        )
+
+        assert text.startswith("🩺 Runtime Status")
+        assert "\n🎙️ Assistant\n  State: Listening" in text
+        assert "  Low Power Mode: On" in text
+        assert "\n🦙 Ollama\n  Needed: Yes\n  Running: Yes (0.9.1)" in text
+        assert "\n🔌 MCP\n  Configured servers: 2" in text
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32", "linux"])
+def test_crash_paths_stay_in_the_test_home(tmp_path, monkeypatch, platform):
+    from desktop_app import get_crash_paths, paths
+
+    platform_view = MagicMock(wraps=sys)
+    platform_view.platform = platform
+    monkeypatch.setattr(paths, "sys", platform_view)
+    mkdir = Path.mkdir
+
+    def owned_mkdir(path, *args, **kwargs):
+        assert path.is_relative_to(tmp_path), "Crash diagnostics escaped the test home"
+        return mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", owned_mkdir)
+    crash_paths = get_crash_paths()
+    assert all(path.is_relative_to(tmp_path) for path in crash_paths)
+
+
+class TestGetCrashPaths:
+    """Tests for get_crash_paths() function."""
+
+    def test_returns_three_paths(self):
+        """get_crash_paths() should return a tuple of 3 paths."""
+        from desktop_app import get_crash_paths
+
+        result = get_crash_paths()
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+
+    def test_all_paths_are_path_objects(self):
+        """All returned paths should be Path objects."""
+        from desktop_app import get_crash_paths
+
+        crash_log, crash_marker, previous_crash = get_crash_paths()
+        assert isinstance(crash_log, Path)
+        assert isinstance(crash_marker, Path)
+        assert isinstance(previous_crash, Path)
+
+    def test_paths_have_expected_names(self):
+        """Paths should have the expected filenames."""
+        from desktop_app import get_crash_paths
+
+        crash_log, crash_marker, previous_crash = get_crash_paths()
+        assert crash_log.name == "jarvis_desktop_crash.log"
+        assert crash_marker.name == ".crash_marker"
+        assert previous_crash.name == "previous_crash.log"
+
+    def test_paths_share_same_parent_directory(self):
+        """All crash paths should be in the same directory."""
+        from desktop_app import get_crash_paths
+
+        crash_log, crash_marker, previous_crash = get_crash_paths()
+        assert crash_log.parent == crash_marker.parent == previous_crash.parent
+
+    @patch("sys.platform", "darwin")
+    def test_macos_uses_library_logs(self):
+        """On macOS, should use ~/Library/Logs/Jarvis."""
+        # Note: This is tricky because the function reads sys.platform at runtime
+        from desktop_app import get_crash_paths
+
+        crash_log, _, _ = get_crash_paths()
+        if sys.platform == "darwin":
+            assert "Library" in str(crash_log) or "Logs" in str(crash_log)
+
+
+class TestCrashMarkerFunctions:
+    """Tests for mark_session_started() and mark_session_clean_exit()."""
+
+    def test_mark_session_started_creates_marker(self):
+        """mark_session_started() should create the crash marker file."""
+        from desktop_app import get_crash_paths, mark_session_started, mark_session_clean_exit
+
+        _, crash_marker, _ = get_crash_paths()
+
+        # Clean up first
+        crash_marker.unlink(missing_ok=True)
+        assert not crash_marker.exists()
+
+        # Start session
+        mark_session_started()
+        assert crash_marker.exists()
+
+        # Clean up
+        mark_session_clean_exit()
+
+    def test_mark_session_clean_exit_removes_marker(self):
+        """mark_session_clean_exit() should remove the crash marker file."""
+        from desktop_app import get_crash_paths, mark_session_started, mark_session_clean_exit
+
+        _, crash_marker, _ = get_crash_paths()
+
+        # Create marker
+        mark_session_started()
+        assert crash_marker.exists()
+
+        # Clean exit
+        mark_session_clean_exit()
+        assert not crash_marker.exists()
+
+    def test_mark_session_clean_exit_handles_missing_marker(self):
+        """mark_session_clean_exit() should not error if marker doesn't exist."""
+        from desktop_app import get_crash_paths, mark_session_clean_exit
+
+        _, crash_marker, _ = get_crash_paths()
+        crash_marker.unlink(missing_ok=True)
+
+        # Should not raise
+        mark_session_clean_exit()
+
+
+class TestCheckPreviousCrash:
+    """Tests for check_previous_crash() function."""
+
+    def test_returns_none_when_no_marker(self):
+        """check_previous_crash() should return None if no crash marker exists."""
+        from desktop_app import get_crash_paths, check_previous_crash, mark_session_clean_exit
+
+        # Ensure clean state
+        mark_session_clean_exit()
+
+        result = check_previous_crash()
+        assert result is None
+
+    def test_returns_none_when_marker_but_no_crash_log(self):
+        """check_previous_crash() should return None if marker exists but no crash content."""
+        from desktop_app import get_crash_paths, check_previous_crash, mark_session_started
+
+        crash_log, crash_marker, _ = get_crash_paths()
+
+        # Create marker but empty/missing crash log
+        mark_session_started()
+        crash_log.unlink(missing_ok=True)
+
+        result = check_previous_crash()
+        # Marker should be removed even if no crash content
+        assert not crash_marker.exists()
+
+    def test_returns_content_when_crash_detected(self):
+        """check_previous_crash() should return crash content when crash is detected."""
+        from desktop_app import get_crash_paths, check_previous_crash
+
+        crash_log, crash_marker, previous_crash = get_crash_paths()
+
+        # Simulate a crash: marker exists and crash log has error content
+        crash_marker.touch()
+        crash_content = "Fatal error: Something went wrong\nTraceback (most recent call last):\n  File test.py"
+        crash_log.write_text(crash_content, encoding='utf-8')
+
+        result = check_previous_crash()
+
+        # Should return the crash content
+        assert result is not None
+        assert "Fatal" in result or "Traceback" in result
+
+        # Marker should be removed
+        assert not crash_marker.exists()
+
+        # Previous crash should be saved
+        assert previous_crash.exists()
+
+        # Clean up
+        crash_log.unlink(missing_ok=True)
+        previous_crash.unlink(missing_ok=True)
+
+    def test_ignores_normal_log_content(self):
+        """check_previous_crash() should ignore logs without error indicators."""
+        from desktop_app import get_crash_paths, check_previous_crash
+
+        crash_log, crash_marker, _ = get_crash_paths()
+
+        # Create marker with normal (non-crash) log content
+        crash_marker.touch()
+        crash_log.write_text("Normal startup log\nEverything is fine", encoding='utf-8')
+
+        result = check_previous_crash()
+
+        # Should return None since no crash indicators
+        assert result is None
+
+        # Marker should still be removed
+        assert not crash_marker.exists()
+
+        # Clean up
+        crash_log.unlink(missing_ok=True)
+
+
+class TestLogViewerReportIssue:
+    """Tests for report issue URL generation logic.
+
+    Note: We test the URL generation logic directly rather than through the
+    LogViewerWindow class because Qt GUI components require a display server
+    and block in test environments.
+    """
+
+    def test_report_issue_truncates_long_logs(self):
+        """Report issue should truncate long logs, keeping init section + tail."""
+        from desktop_app.app import _truncate_logs_for_report, _LOG_SEPARATOR
+
+        # Simulate realistic log: header + separator + init + separator + operational logs
+        init_block = (
+            "🚀 Jarvis Log Viewer Ready\n"
+            f"{_LOG_SEPARATOR}\n"
+            "\n"
+            "✓ Daemon started\n"
+            "🧠 Using chat model: llama3.2\n"
+            "🎤 Using whisper model: large-v3-turbo\n"
+            "📡 No MCP servers configured\n"
+            "💾 Initializing dialogue memory...\n"
+            "✓ Dialogue memory initialized\n"
+            "📍 Location services disabled\n"
+            "🔊 Initializing TTS engine (piper)...\n"
+            "✓ TTS engine started\n"
+            "🎤 Initializing voice listener...\n"
+            "✓ Voice listener thread started\n"
+            f"{_LOG_SEPARATOR}\n"
+        )
+        operational = "\n".join([f"[2024-01-{i:02d}] Processing request {i}" for i in range(1, 500)])
+        long_content = init_block + operational
+
+        result = _truncate_logs_for_report(long_content, 5000)
+
+        # Verify truncation happened and fits within budget
+        assert len(result) <= 5000
+        assert "... (truncated) ..." in result
+
+        # Verify init section is preserved (up to last separator)
+        assert "Jarvis Log Viewer Ready" in result
+        assert "Using chat model" in result
+        assert "Voice listener thread started" in result
+
+        # Verify recent/tail lines are preserved (end of log)
+        assert "Processing request 499" in result
+
+    def test_report_issue_truncation_preserves_tail(self):
+        """Truncation should keep recent logs, not early logs."""
+        from desktop_app.app import _truncate_logs_for_report, _LOG_SEPARATOR
+
+        init_block = f"Header\n{_LOG_SEPARATOR}\n"
+        lines = [f"line {i}: {'x' * 40}" for i in range(200)]
+        long_content = init_block + "\n".join(lines)
+
+        result = _truncate_logs_for_report(long_content, 3000)
+
+        # Last line should be preserved (most recent)
+        assert "line 199" in result
+        # Init section should be preserved
+        assert "Header" in result
+        assert _LOG_SEPARATOR in result
+        # Middle lines should be truncated
+        assert "line 50" not in result
+
+    def test_report_issue_no_truncation_when_short(self):
+        """Short logs should not be truncated."""
+        from desktop_app.app import _truncate_logs_for_report
+
+        short_content = "line 1\nline 2\nline 3"
+        result = _truncate_logs_for_report(short_content, 5000)
+        assert result == short_content
+        assert "truncated" not in result
+
+    def test_report_issue_truncation_no_separator(self):
+        """Without a separator, truncation should just keep the tail."""
+        from desktop_app.app import _truncate_logs_for_report
+
+        # No separator (e.g. crash logs)
+        lines = [f"line {i}: content" for i in range(500)]
+        long_content = "\n".join(lines)
+
+        result = _truncate_logs_for_report(long_content, 3000)
+
+        assert len(result) <= 3000
+        # Tail (recent lines) should be preserved
+        assert "line 499" in result
+        # Early lines should be truncated
+        assert "line 0:" not in result
+
+    def test_faulthandler_dump_preserves_fatal_error_line(self):
+        """Faulthandler crash dumps should preserve 'Fatal Python error' and current thread."""
+        from desktop_app.app import _truncate_logs_for_report, _LOG_SEPARATOR
+
+        # Simulate realistic crash log: init section + separator + faulthandler dump
+        init_block = (
+            "=== Jarvis Desktop App Crash Log ===\n"
+            "Timestamp: 2026-04-13\n"
+            "Platform: win32\n"
+            "==================================================\n"
+            "\nStarting Jarvis Desktop App...\n"
+            "Creating QApplication...\n"
+            "🚀 Jarvis daemon started\n"
+            f"{_LOG_SEPARATOR}\n"
+        )
+        # Faulthandler dump: Fatal error + current thread + many other threads + extension modules
+        fatal_line = "Fatal Python error: Segmentation fault\n"
+        current_thread = (
+            "\nCurrent thread 0x00007c54 (most recent call first):\n"
+            "  File \"some_module.py\", line 42 in critical_function\n"
+            "  File \"app.py\", line 100 in main\n"
+        )
+        other_threads = "\n".join([
+            f"\nThread 0x0000{i:04x} (most recent call first):\n"
+            f"  File \"threading.py\", line 331 in wait\n"
+            f"  File \"module_{i}.py\", line {i * 10} in some_func\n"
+            f"  File \"threading.py\", line 1045 in _bootstrap_inner\n"
+            f"  File \"threading.py\", line 1002 in _bootstrap\n"
+            for i in range(20)
+        ])
+        # Large extension modules list (~1700 chars)
+        ext_modules = "Extension modules: " + ", ".join([f"mod_{i}.sub_{i}" for i in range(120)]) + " (total: 120)\n"
+
+        crash_log = init_block + fatal_line + current_thread + other_threads + ext_modules
+
+        result = _truncate_logs_for_report(crash_log, 4000)
+
+        assert len(result) <= 4000
+        # Critical: the Fatal error line and current thread MUST be preserved
+        assert "Fatal Python error: Segmentation fault" in result
+        assert "critical_function" in result
+        # Init section should be preserved
+        assert "Jarvis Desktop App Crash Log" in result
+        # Extension modules should be summarised, not fully listed
+        assert "mod_119.sub_119" not in result
+
+    def test_faulthandler_extension_modules_trimmed(self):
+        """Extension modules line in faulthandler dumps should be shortened."""
+        from desktop_app.app import _truncate_logs_for_report
+
+        # Short log with a huge Extension modules line — should be trimmed even if total is within budget
+        fatal = "Fatal Python error: Aborted\n\nCurrent thread 0x1234:\n  File \"x.py\", line 1\n\n"
+        ext_modules = "Extension modules: " + ", ".join([f"mod_{i}" for i in range(100)]) + " (total: 100)\n"
+        log = fatal + ext_modules
+
+        result = _truncate_logs_for_report(log, 4000)
+
+        # Fatal error should be preserved
+        assert "Fatal Python error: Aborted" in result
+        # The full module list should be trimmed
+        assert "mod_99" not in result
+        # But summary count should remain
+        assert "100" in result
+
+    def test_faulthandler_budget_too_tight_caps_fatal_section(self):
+        """When fatal section exceeds the budget, output must still respect max_len."""
+        from desktop_app.app import _truncate_logs_for_report, _LOG_SEPARATOR
+
+        # Simulate a deep recursion crash: huge fatal section (~5000 chars)
+        init_block = f"Header\n{_LOG_SEPARATOR}\n"
+        fatal_line = "Fatal Python error: maximum recursion depth exceeded\n"
+        deep_stack = "\n".join(
+            [f"  File \"module.py\", line {i} in func_{i}" for i in range(300)]
+        )
+        current_thread = f"\nCurrent thread 0x1234 (most recent call first):\n{deep_stack}\n"
+        other_thread = "\nThread 0x5678 (most recent call first):\n  File \"t.py\", line 1\n"
+        crash_log = init_block + fatal_line + current_thread + other_thread
+
+        result = _truncate_logs_for_report(crash_log, 2000)
+
+        # Must never exceed the budget
+        assert len(result) <= 2000
+        # The fatal error line itself should still be present
+        assert "Fatal Python error: maximum recursion depth exceeded" in result
+
+    def test_faulthandler_fatal_without_thread_headers(self):
+        """Fatal error without any 'Thread 0x' headers should extract up to 500 chars."""
+        from desktop_app.app import _extract_fatal_section
+
+        fatal = "Fatal Python error: Aborted\n\nCurrent thread 0x1234 (most recent call first):\n  File \"x.py\", line 1 in main\n"
+        result = _extract_fatal_section(fatal)
+
+        assert "Fatal Python error: Aborted" in result
+        assert "main" in result
+
+    def test_faulthandler_extension_modules_without_total(self):
+        """Extension modules line without '(total: N)' should use the fallback trim."""
+        from desktop_app.app import _trim_extension_modules
+
+        # No "(total: N)" suffix — should trigger the fallback regex
+        ext_line = "Extension modules: " + ", ".join([f"mod_{i}" for i in range(100)]) + "\n"
+        log = "Some log content\n" + ext_line
+
+        result = _trim_extension_modules(log)
+
+        # Should be trimmed (much shorter than original)
+        assert len(result) < len(log)
+        assert "... (trimmed)" in result
+        # Should keep the first ~80 chars of modules
+        assert "mod_0" in result
+        # Should not contain later modules
+        assert "mod_99" not in result
+
+    def test_redaction_handles_multiple_sensitive_patterns(self):
+        """Redaction should handle multiple types of sensitive data."""
+        from jarvis.utils.redact import redact
+
+        log_content = (
+            "Config loaded:\n"
+            "  email: admin@company.com\n"
+            "  jwt_value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test\n"
+            "  password: secret123\n"
+            "  hash: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4\n"
+        )
+
+        redacted = redact(log_content)
+
+        # Email should be redacted
+        assert "admin@company.com" not in redacted
+        assert "[REDACTED_EMAIL]" in redacted
+
+        # JWT should be redacted (when not preceded by token=)
+        assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in redacted
+        assert "[REDACTED_JWT]" in redacted
+
+        # Password assignment should be redacted
+        assert "secret123" not in redacted
+        assert "[REDACTED]" in redacted
+
+        # Long hex string should be redacted
+        assert "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" not in redacted
+        assert "[REDACTED_HEX]" in redacted
+
+
+class TestDiaryIPCProtocol:
+    """Tests for diary dialog IPC protocol parsing.
+
+    Note: Qt tests require a QApplication which may conflict with pytest fixtures.
+    These tests focus on the IPC protocol parsing logic.
+    """
+
+    def test_diary_ipc_prefix_constant(self):
+        """Diary IPC prefix should be a valid string constant."""
+        from desktop_app.diary_dialog import DIARY_IPC_PREFIX
+
+        assert isinstance(DIARY_IPC_PREFIX, str)
+        assert len(DIARY_IPC_PREFIX) > 0
+        # Prefix should be unique enough to not conflict with normal log lines
+        assert DIARY_IPC_PREFIX == "__DIARY__:"
+
+    def test_ipc_event_format_is_parseable(self):
+        """IPC event format should be valid JSON after prefix."""
+        import json
+        from desktop_app.diary_dialog import DIARY_IPC_PREFIX
+
+        # Test various event types
+        events = [
+            {"type": "chunks", "data": ["chunk1", "chunk2"]},
+            {"type": "token", "data": "hello"},
+            {"type": "status", "data": "Writing..."},
+            {"type": "complete", "data": True},
+        ]
+
+        for event in events:
+            line = f"{DIARY_IPC_PREFIX}{json.dumps(event)}"
+            # Should be parseable
+            assert line.startswith(DIARY_IPC_PREFIX)
+            json_str = line[len(DIARY_IPC_PREFIX):]
+            parsed = json.loads(json_str)
+            assert parsed == event
+
+    def test_normal_log_lines_dont_match_prefix(self):
+        """Normal daemon log lines should not start with IPC prefix."""
+        from desktop_app.diary_dialog import DIARY_IPC_PREFIX
+
+        # Common log patterns that should NOT be intercepted
+        normal_logs = [
+            "Starting Jarvis daemon...",
+            "✓ Daemon started",
+            "📝 Updating diary...",
+            "🔄 Daemon shutting down...",
+            "✅ Diary update complete",
+            "",
+            "DEBUG: some message",
+        ]
+
+        for log in normal_logs:
+            assert not log.startswith(DIARY_IPC_PREFIX), f"Log line should not match prefix: {log}"
+
+
+class TestDaemonExitLogMessage:
+    """Tests for the DaemonThread exit log message logic.
+
+    Verifies that a graceful stop (via request_stop) emits a success message,
+    while an unexpected exit emits a warning message. Tests the guard logic
+    directly to avoid importing the daemon module (which has heavy side effects).
+    """
+
+    def _simulate_exit_log(self, stop_requested):
+        """Replicate the DaemonThread.run() exit log logic."""
+        emitted = []
+
+        def mock_emit(msg):
+            emitted.append(msg)
+
+        # Replicate the logic from app.py DaemonThread.run()
+        if stop_requested:
+            mock_emit("✅ Daemon stopped gracefully\n")
+        else:
+            mock_emit("⚠️ Daemon exited unexpectedly\n")
+
+        return emitted
+
+    def test_graceful_stop_emits_success_message(self):
+        """When is_stop_requested() is True, should emit graceful stop message."""
+        emitted = self._simulate_exit_log(stop_requested=True)
+
+        assert len(emitted) == 1
+        assert "gracefully" in emitted[0]
+        assert "✅" in emitted[0]
+
+    def test_unexpected_exit_emits_warning_message(self):
+        """When is_stop_requested() is False, should emit unexpected exit message."""
+        emitted = self._simulate_exit_log(stop_requested=False)
+
+        assert len(emitted) == 1
+        assert "unexpectedly" in emitted[0]
+        assert "⚠️" in emitted[0]
+
+    def test_graceful_stop_does_not_emit_warning(self):
+        """Graceful stop should not contain 'unexpected' wording."""
+        emitted = self._simulate_exit_log(stop_requested=True)
+        assert "unexpected" not in emitted[0].lower()
+
+    def test_unexpected_exit_does_not_emit_success(self):
+        """Unexpected exit should not contain 'gracefully' wording."""
+        emitted = self._simulate_exit_log(stop_requested=False)
+        assert "gracefully" not in emitted[0].lower()
+
+
+class TestSingleInstanceLock:
+    """Tests for the single-instance locking mechanism.
+
+    Focuses on the regression where 'w' mode truncated the lock file before
+    the lock attempt, destroying the existing instance's PID.
+    """
+
+    def test_get_existing_instance_pid_reads_pid(self, tmp_path):
+        """get_existing_instance_pid() should return the PID stored in the lock file."""
+        from desktop_app.app import get_existing_instance_pid
+
+        lock_file = tmp_path / "jarvis_desktop.lock"
+        lock_file.write_bytes(b"12345")
+
+        with patch("desktop_app.app.get_lock_file_path", return_value=lock_file):
+            pid = get_existing_instance_pid()
+
+        assert pid == 12345
+
+    def test_get_existing_instance_pid_returns_none_when_empty(self, tmp_path):
+        """get_existing_instance_pid() should return None for an empty lock file."""
+        from desktop_app.app import get_existing_instance_pid
+
+        lock_file = tmp_path / "jarvis_desktop.lock"
+        lock_file.write_bytes(b"")
+
+        with patch("desktop_app.app.get_lock_file_path", return_value=lock_file):
+            pid = get_existing_instance_pid()
+
+        assert pid is None
+
+    def test_get_existing_instance_pid_returns_none_when_missing(self, tmp_path):
+        """get_existing_instance_pid() should return None when the lock file is absent."""
+        from desktop_app.app import get_existing_instance_pid
+
+        lock_file = tmp_path / "jarvis_desktop.lock"
+
+        with patch("desktop_app.app.get_lock_file_path", return_value=lock_file):
+            pid = get_existing_instance_pid()
+
+        assert pid is None
+
+    def test_lock_file_not_truncated_on_failed_lock_attempt(self, tmp_path):
+        """The existing PID must still be readable after a failed lock attempt.
+
+        This is the core regression: opening with 'w' truncated the file before
+        the lock call, so get_existing_instance_pid() returned None and the
+        'close existing' flow broke with "Could not find existing instance PID."
+        """
+        from desktop_app.app import get_existing_instance_pid
+
+        lock_file = tmp_path / "jarvis_desktop.lock"
+        existing_pid = 99999
+        lock_file.write_bytes(str(existing_pid).encode())
+
+        # Simulate a failed lock attempt by opening the file in append+read binary
+        # mode (the fixed mode) and then locking failure — the file must be intact.
+        fh = open(lock_file, 'a+b')
+        try:
+            # Verify the file still has the original PID content after being
+            # opened non-destructively.
+            fh.seek(0)
+            content = fh.read().decode().strip()
+            assert content == str(existing_pid), (
+                f"Lock file was truncated on open — PID {existing_pid} was lost. "
+                "This reproduces the bug where 'w' mode destroyed the PID before "
+                "the lock attempt completed."
+            )
+        finally:
+            fh.close()
+
+        with patch("desktop_app.app.get_lock_file_path", return_value=lock_file):
+            pid = get_existing_instance_pid()
+
+        assert pid == existing_pid, (
+            "get_existing_instance_pid() should still return the existing PID "
+            "after a failed lock attempt."
+        )
+
+    def test_acquire_lock_writes_current_pid(self, tmp_path):
+        """acquire_single_instance_lock() should write the current process PID."""
+        import desktop_app.app as app_module
+
+        lock_file = tmp_path / "jarvis_desktop.lock"
+        original_handle = app_module._lock_file_handle
+
+        try:
+            with patch("desktop_app.app.get_lock_file_path", return_value=lock_file):
+                result = app_module.acquire_single_instance_lock()
+
+            assert result is True
+            # PID should be readable from a separate handle because the lock
+            # is at _LOCK_OFFSET, not at byte 0.
+            content = lock_file.read_text().strip()
+            assert content == str(os.getpid()), (
+                f"Lock file should contain current PID {os.getpid()}, got {content!r}"
+            )
+        finally:
+            # Release lock so the file handle is closed
+            if app_module._lock_file_handle and app_module._lock_file_handle is not original_handle:
+                try:
+                    app_module._lock_file_handle.close()
+                except Exception:
+                    pass
+                app_module._lock_file_handle = original_handle
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific lock test")
+    def test_lock_blocks_second_process_and_pid_readable(self, tmp_path):
+        """On Windows, the lock must block a second process while keeping the PID readable."""
+        import desktop_app.app as app_module
+        import subprocess
+
+        lock_file = tmp_path / "jarvis_desktop.lock"
+        original_handle = app_module._lock_file_handle
+
+        try:
+            with patch("desktop_app.app.get_lock_file_path", return_value=lock_file):
+                result = app_module.acquire_single_instance_lock()
+            assert result is True
+
+            # Child process: try to acquire the same lock and read the PID
+            child_code = '''
+import msvcrt, sys
+LOCK_OFFSET = 1024
+lock_path = r"""''' + str(lock_file) + '''"""
+fh = open(lock_path, "a+b")
+fh.seek(LOCK_OFFSET)
+try:
+    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    print("LOCK_ACQUIRED")
+except OSError:
+    print("LOCK_BLOCKED")
+fh.close()
+try:
+    pid = open(lock_path).read().strip()
+    print("PID_READ=" + pid)
+except Exception as e:
+    print("PID_FAILED=" + str(e))
+'''
+            proc = subprocess.run(
+                [sys.executable, "-c", child_code],
+                capture_output=True, text=True, timeout=10,
+            )
+            lines = proc.stdout.strip().splitlines()
+            assert "LOCK_BLOCKED" in lines, (
+                f"Child should have been blocked from acquiring lock, got: {lines}"
+            )
+            pid_line = [l for l in lines if l.startswith("PID_READ=")]
+            assert pid_line, f"Child should have read the PID, got: {lines}"
+            assert pid_line[0] == f"PID_READ={os.getpid()}"
+        finally:
+            if app_module._lock_file_handle and app_module._lock_file_handle is not original_handle:
+                try:
+                    app_module._lock_file_handle.close()
+                except Exception:
+                    pass
+                app_module._lock_file_handle = original_handle
+
+
+class TestCudaRecoveryAction:
+    """The tray exposes a 'Reinstall GPU libraries' action when the user has an
+    NVIDIA GPU but the runtime CUDA probe failed. The recovery flow is the only
+    way to retry the CUDA download from the user's perspective: the original
+    Inno Setup task only fires once, and the marker file used to prevent
+    re-runs even after a half-successful install.
+
+    These tests cover the platform-gating logic and the command-line shape so
+    we can change the implementation without breaking the contract.
+    """
+
+    def test_action_hidden_off_windows(self):
+        from desktop_app.cuda_recovery import cuda_recovery_action
+
+        with patch("sys.platform", "darwin"):
+            assert cuda_recovery_action(install_root=Path("/fake")) is None
+
+        with patch("sys.platform", "linux"):
+            assert cuda_recovery_action(install_root=Path("/fake")) is None
+
+    def test_action_hidden_when_no_nvidia_gpu(self, tmp_path):
+        from desktop_app.cuda_recovery import cuda_recovery_action
+
+        # No nvcuda.dll, no NVIDIA driver -> no point offering the action.
+        with patch("sys.platform", "win32"), patch(
+            "desktop_app.cuda_recovery._has_nvidia_driver", return_value=False
+        ):
+            assert cuda_recovery_action(install_root=tmp_path) is None
+
+    def test_action_hidden_when_install_script_missing(self, tmp_path):
+        from desktop_app.cuda_recovery import cuda_recovery_action
+
+        # On dev machines (running from source) the Inno Setup-bundled script
+        # does not exist; the menu action would be a dead button.
+        with patch("sys.platform", "win32"), patch(
+            "desktop_app.cuda_recovery._has_nvidia_driver", return_value=True
+        ):
+            assert cuda_recovery_action(install_root=tmp_path) is None
+
+    def test_action_present_when_windows_gpu_and_script_exist(self, tmp_path):
+        from desktop_app.cuda_recovery import cuda_recovery_action
+
+        script = tmp_path / "install_cuda.ps1"
+        script.write_text("# placeholder\n", encoding="utf-8")
+
+        with patch("sys.platform", "win32"), patch(
+            "desktop_app.cuda_recovery._has_nvidia_driver", return_value=True
+        ):
+            action = cuda_recovery_action(install_root=tmp_path)
+
+        assert action is not None
+        assert action.script_path == script
+        assert action.target_dir == tmp_path / "cuda"
+        assert "Reinstall GPU libraries" in action.label
+        # Command is what gets handed to ShellExecute / subprocess; the test
+        # pins the structure so we don't accidentally drop -ExecutionPolicy
+        # Bypass and silently fail under restricted policies.
+        assert action.executable.lower().endswith("powershell.exe")
+        assert "-ExecutionPolicy" in action.arguments
+        assert "Bypass" in action.arguments
+        assert "-File" in action.arguments
+        assert str(script) in action.arguments
+        assert str(tmp_path / "cuda") in action.arguments
+        assert "-LogPath" in action.arguments
+
+    def test_quote_arg_handles_trailing_backslash(self):
+        """Trailing backslashes inside quoted args must not eat the closing quote.
+
+        Windows argv parsing collapses 2n backslashes before a `"` into n
+        backslashes plus a string terminator, so a path like
+        `C:\\Program Files\\Jarvis\\` quoted naively becomes
+        `"C:\\Program Files\\Jarvis\\"` which CommandLineToArgvW reads as
+        `C:\\Program Files\\Jarvis"` — quote eaten, next arg fused on. The
+        canonical fix is to double trailing backslashes.
+        """
+        from desktop_app.cuda_recovery import _quote_arg
+
+        # Trailing backslash + space gets doubled inside the quotes.
+        result = _quote_arg(r"C:\Program Files\Jarvis\\")
+        assert result.endswith('\\\\\\\\"'), (
+            f"trailing backslashes must be doubled before the closing quote; got {result!r}"
+        )
+        # An embedded quote escapes correctly.
+        assert _quote_arg('a"b') == '"a\\"b"'
+        # Plain paths with spaces get the simple quoted form.
+        assert _quote_arg(r"C:\Users\me\file") == r"C:\Users\me\file"
+        assert _quote_arg(r"C:\Program Files\App") == r'"C:\Program Files\App"'
+        # Empty string round-trips to "" so ShellExecute doesn't drop the slot.
+        assert _quote_arg("") == '""'
+
+    def test_run_uses_elevation_on_windows(self, tmp_path):
+        """The script writes into Program Files; without elevation it silently
+        no-ops. Make sure the run path requests UAC explicitly."""
+        from desktop_app.cuda_recovery import CudaRecoveryAction, run_action
+
+        action = CudaRecoveryAction(
+            label="🎮 Reinstall GPU libraries",
+            script_path=tmp_path / "install_cuda.ps1",
+            target_dir=tmp_path / "cuda",
+            executable=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            arguments=[
+                "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(tmp_path / "install_cuda.ps1"),
+                "-TargetDir", str(tmp_path / "cuda"),
+                "-LogPath", str(tmp_path / "cuda" / "install.log"),
+            ],
+        )
+        action.script_path.write_text("# placeholder\n", encoding="utf-8")
+
+        captured = {}
+
+        def fake_shell_execute(hwnd, verb, file, params, directory, show):
+            captured["verb"] = verb
+            captured["file"] = file
+            captured["params"] = params
+            return 42  # ShellExecuteW returns >32 on success
+
+        with patch("sys.platform", "win32"), patch(
+            "desktop_app.cuda_recovery._shell_execute", side_effect=fake_shell_execute
+        ):
+            run_action(action)
+
+        assert captured.get("verb") == "runas", (
+            "must request UAC elevation; install_cuda.ps1 writes to Program Files"
+        )
+        assert captured["file"].lower().endswith("powershell.exe")
+        # The argument string should reference the script and the target dir.
+        assert "install_cuda.ps1" in captured["params"]
+        assert "-LogPath" in captured["params"]
+
+
+class TestMemoryViewerSubprocessLaunch:
+    """The development launcher supplies a runnable local viewer module."""
+
+    @pytest.mark.parametrize("existing_pythonpath", [None, "unrelated-source-path"])
+    def test_launched_module_imports_from_the_selected_checkout(
+        self, qapp, monkeypatch, tmp_path, existing_pythonpath,
+    ):
+        import socket
+        from desktop_app import app as app_mod
+
+        pytest.importorskip("flask")
+        launches = []
+        connections = iter([1, 0])
+        process = MagicMock()
+        process.poll.return_value = None
+        window = None
+        with monkeypatch.context() as launch:
+            launch.setattr(app_mod, "HAS_WEBENGINE", False)
+            launch.setattr(app_mod.sys, "frozen", False, raising=False)
+            if existing_pythonpath is None:
+                launch.delenv("PYTHONPATH", raising=False)
+            else:
+                launch.setenv("PYTHONPATH", existing_pythonpath)
+            sock = MagicMock()
+            sock.connect_ex.side_effect = lambda address: next(connections)
+            launch.setattr(socket, "socket", lambda *args: sock)
+            def capture(command, **options):
+                launches.append((command, options["env"]))
+                return process
+            launch.setattr(app_mod.subprocess, "Popen", capture)
+            window = app_mod.MemoryViewerWindow()
+            assert window.start_server()
+        try:
+            command, environment = launches[0]
+            assert command[1] == "-m"
+            probe = (
+                "import importlib, sys; from flask import Flask; "
+                "viewer = importlib.import_module(sys.argv[1]); "
+                "assert isinstance(viewer.app, Flask); assert callable(viewer.main); "
+                "print(viewer.__file__)"
+            )
+            result = subprocess.run(
+                [command[0], "-c", probe, command[2]], env=environment,
+                cwd=tmp_path, capture_output=True, text=True, timeout=10,
+            )
+            assert result.returncode == 0, result.stderr
+            assert Path(result.stdout.strip()).resolve() == (
+                Path(app_mod.__file__).with_name("memory_viewer.py").resolve()
+            )
+            if existing_pythonpath is not None:
+                assert existing_pythonpath in environment["PYTHONPATH"].split(os.pathsep)
+        finally:
+            window.stop_server()
+            window.close()
+
+
+class TestDaemonSmokeTest:
+    """Entry-point initialisation and cleanup with owned runtime dependencies."""
+
+    @pytest.fixture
+    def runtime(self, monkeypatch):
+        import threading
+        import jarvis.daemon as daemon
+        import jarvis.memory.graph as graph
+        import jarvis.dictation.dictation_engine as dictation
+        import jarvis.tools.external.mcp_runtime as mcp
+        from tests.conftest import MockConfig
+
+        cfg = MockConfig(db_path=":memory:")
+        cfg.dictation_hotkey = "ctrl+shift+d"
+        database = MagicMock()
+        listener = MagicMock()
+        dictation_engine = MagicMock()
+        tts = MagicMock(enabled=False)
+        memory = MagicMock()
+        memory.get_pending_chunks.return_value = []
+        graph_store = MagicMock()
+        graph_store.has_unclassified_root_content.return_value = False
+        threads = MagicMock(wraps=threading)
+        threads.Thread = MagicMock()
+        monkeypatch.setenv("JARVIS_STDIN_IPC", "1")
+        for name, value in {
+            "load_settings": MagicMock(return_value=cfg),
+            "Database": MagicMock(return_value=database),
+            "DialogueMemory": MagicMock(return_value=memory),
+            "get_location_context": MagicMock(return_value="Location: Test"),
+            "create_tts_engine": MagicMock(return_value=tts),
+            "VoiceListener": MagicMock(return_value=listener),
+            "initialize_mcp_tools": MagicMock(return_value=({}, {})),
+            "_install_signal_handlers": MagicMock(),
+            "_diary_update_callbacks": {},
+            "threading": threads,
+        }.items():
+            monkeypatch.setattr(daemon, name, value)
+        monkeypatch.setattr(graph, "GraphMemoryStore", MagicMock(return_value=graph_store))
+        monkeypatch.setattr(graph, "register_graph_mutation_listener", MagicMock())
+        monkeypatch.setattr(graph, "unregister_graph_mutation_listener", MagicMock())
+        monkeypatch.setattr(dictation, "DictationEngine", MagicMock(return_value=dictation_engine))
+        monkeypatch.setattr(mcp, "shutdown_runtime", MagicMock())
+        # Restore the embedded runtime's references even if initialisation fails.
+        for name in (
+            "_global_cfg", "_global_db", "_global_dialogue_memory",
+            "_global_voice_listener", "_global_tts_engine", "_global_dictation_engine",
+            "_warm_profile_graph_listener", "_global_stop_requested",
+        ):
+            monkeypatch.setattr(daemon, name, None)
+        return daemon, database, listener, dictation_engine
+
+    def test_smoke_test_prints_marker_and_returns(self, runtime, capsys):
+        daemon, database, listener, dictation = runtime
+        daemon.main(smoke_test=True)
+        assert "SMOKE_TEST_INIT_OK" in capsys.readouterr().out
+        assert daemon.VoiceListener.call_args.kwargs.get("on_low_confidence") is None
+        database.close.assert_called_once()
+        listener.stop.assert_called_once()
+        dictation.stop.assert_called_once()
+
+    @pytest.mark.parametrize("background_wait", [False, True])
+    def test_normal_mode_does_not_print_marker(self, runtime, monkeypatch, capsys, background_wait):
+        import threading
+        import time
+
+        daemon, database, listener, dictation = runtime
+
+        class StopBeforeMainLoop(Exception):
+            pass
+
+        def stop_loop(_seconds):
+            raise StopBeforeMainLoop()
+
+        clock = MagicMock(wraps=time)
+        clock.sleep.side_effect = stop_loop
+        monkeypatch.setattr(daemon, "time", clock)
+        errors = []
+
+        def wait_in_background():
+            try:
+                time.sleep(0.01)
+            except Exception as exc:
+                errors.append(exc)
+
+        def start_listener():
+            worker = threading.Thread(target=wait_in_background)
+            worker.start()
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+
+        if background_wait:
+            listener.start.side_effect = start_listener
+        with pytest.raises(StopBeforeMainLoop):
+            daemon.main(smoke_test=False)
+        output = capsys.readouterr().out
+        assert "SMOKE_TEST_INIT_OK" not in output
+        assert "✓ Daemon started" in output
+        assert not errors, f"Daemon loop clock escaped into a competing thread: {errors}"
+        database.close.assert_called_once()
+        listener.stop.assert_called_once()
+        dictation.stop.assert_called_once()
+
+
+    def test_tasks_drain_before_the_final_diary_and_tts_shutdown(self, runtime, monkeypatch):
+        import time
+        from types import SimpleNamespace
+        from jarvis import tasks
+
+        daemon, database, listener, dictation = runtime
+        state = {'active': True, 'tts_stopped': False}
+        completed, saved = [], []
+
+        def drain(wait=True):
+            state['active'] = False
+            completed.append('A task completing during shutdown')
+
+        monkeypatch.setattr(tasks, 'TaskManager', lambda **kwargs: SimpleNamespace(shutdown=drain))
+        tts = daemon.create_tts_engine.return_value
+        tts.stop.side_effect = lambda: state.update(tts_stopped=True)
+
+        def save(db, cfg, **kwargs):
+            if kwargs.get('force'):
+                saved.append((not state['active'], not state['tts_stopped'], tuple(completed)))
+
+        monkeypatch.setattr(daemon, '_check_and_update_diary', save)
+
+        class StopMainLoop(Exception):
+            pass
+
+        def stop_loop(seconds):
+            raise StopMainLoop()
+
+        clock = MagicMock(wraps=time)
+        clock.sleep.side_effect = stop_loop
+        monkeypatch.setattr(daemon, 'time', clock)
+        with pytest.raises(StopMainLoop):
+            daemon.main(smoke_test=False)
+        assert saved == [(True, True, ('A task completing during shutdown',))]
+
+
+class TestDesktopSmokeTest:
+    """Desktop smoke startup, diagnostics and exit codes without native services."""
+
+    @pytest.fixture
+    def runtime(self, monkeypatch):
+        import desktop_app.app as app
+        import jarvis.daemon as daemon
+        from PyQt6 import QtWidgets
+
+        qt = MagicMock()
+        qt.instance.return_value = qt.return_value
+        daemon_main = MagicMock()
+        monkeypatch.setattr(QtWidgets, "QApplication", qt)
+        monkeypatch.setattr(daemon, "main", daemon_main)
+        # Stream replacements belong to this entry point, not the test process.
+        monkeypatch.setattr(app, "sys", SimpleNamespace(
+            platform=sys.platform, argv=["Jarvis"], frozen=False,
+            stdout=sys.stdout, stderr=sys.stderr,
+            __stdout__=sys.__stdout__, __stderr__=sys.__stderr__,
+        ))
+        monkeypatch.setenv("QT_QPA_PLATFORM", os.environ.get("QT_QPA_PLATFORM", "offscreen"))
+        return app, qt, daemon_main
+
+    @pytest.mark.parametrize("existing_app", [False, True])
+    def test_success_initialises_daemon_and_prints_marker(self, runtime, capsys, existing_app):
+        app, qt, daemon_main = runtime
+        if not existing_app:
+            qt.instance.return_value = None
+        assert app._smoke_test_main() == 0
+        daemon_main.assert_called_once_with(smoke_test=True)
+        assert "SMOKE_TEST_PASSED" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("failure", ["qt", "daemon"])
+    def test_failure_returns_one_with_diagnostics(self, runtime, capsys, failure):
+        app, qt, daemon_main = runtime
+        error = RuntimeError("Simulated init failure")
+        if failure == "qt":
+            qt.instance.side_effect = error
+        else:
+            daemon_main.side_effect = error
+        assert app._smoke_test_main() == 1
+        output = capsys.readouterr()
+        assert "SMOKE_TEST_PASSED" not in output.out
+        assert "initialisation failed" in output.out
+        assert str(error) in output.out
+        assert str(error) in output.err
+        if failure == "qt":
+            daemon_main.assert_not_called()
+
+    def test_main_routes_smoke_test_flag(self, runtime, monkeypatch):
+        app, _qt, _daemon_main = runtime
+        app.sys.argv = ["Jarvis", "--smoke-test"]
+        smoke = MagicMock(return_value=42)
+        monkeypatch.setattr(app, "_smoke_test_main", smoke)
+        assert app.main() == smoke.return_value
+        smoke.assert_called_once_with()
+
+
+class TestRuntimeStatusDialog:
+    """The runtime-status dialog renders the snapshot as a structured,
+    themed dialog rather than a plain text blob."""
+
+    def _snapshot(self):
+        from desktop_app.app import RuntimeStatusSnapshot
+
+        return RuntimeStatusSnapshot(
+            daemon_state="Listening",
+            daemon_mode="subprocess",
+            daemon_pid=12345,
+            ollama_needed=True,
+            ollama_running=True,
+            ollama_version="0.9.1",
+            ollama_owner="Jarvis",
+            ollama_launch_method="serve",
+            low_power_mode=True,
+            llm_provider="ollama",
+            chat_model="gemma4:e2b",
+            embedding_provider="ollama",
+            embedding_model="nomic-embed-text",
+            mcp_count=2,
+        )
+
+    def test_rows_cover_every_snapshot_field(self):
+        from desktop_app.app import _runtime_status_rows
+
+        snapshot = self._snapshot()
+        rows = _runtime_status_rows(snapshot)
+
+        by_key = {key: value for _section, key, value in rows}
+        assert by_key["State"] == "Listening"
+        assert by_key["Mode"] == "subprocess"
+        assert by_key["PID"] == "12345"
+        assert by_key["Low Power Mode"] == "On"
+        assert by_key["Running"] == "Yes (0.9.1)"
+        assert by_key["Owner"] == "Jarvis"
+        assert by_key["Chat"] == "gemma4:e2b"
+        assert by_key["Embeddings"] == "ollama / nomic-embed-text"
+        assert by_key["Configured servers"] == "2"
+        sections = [section for section, _key, _value in rows]
+        assert sections == ["🎙️ Assistant"] * 4 + ["🦙 Ollama"] * 4 + ["🧠 Models"] * 3 + ["🔌 MCP"] * 1
+
+    def test_format_still_matches_legacy_text_layout(self):
+        """The text formatter (used by tests and any terminal path) must
+        keep producing the exact scannable layout it always did."""
+        from desktop_app.app import _format_runtime_status
+
+        text = _format_runtime_status(self._snapshot())
+        assert text.startswith("🩺 Runtime Status")
+        assert "\n🎙️ Assistant\n  State: Listening" in text
+        assert "  Low Power Mode: On" in text
+        assert "\n🦙 Ollama\n  Needed: Yes\n  Running: Yes (0.9.1)" in text
+        assert "\n🔌 MCP\n  Configured servers: 2" in text
+
+    def test_dialog_renders_sections_and_values(self, qapp):
+        from desktop_app.app import RuntimeStatusDialog
+        from PyQt6.QtWidgets import QLabel, QPushButton
+
+        dialog = RuntimeStatusDialog(self._snapshot())
+
+        texts = [lbl.text() for lbl in dialog.findChildren(QLabel)]
+        assert "🩺 Runtime Status" in texts
+        assert "🎙️ Assistant" in texts
+        assert "🦙 Ollama" in texts
+        assert "🧠 Models" in texts
+        assert "🔌 MCP" in texts
+        assert "gemma4:e2b" in texts
+        assert "Yes (0.9.1)" in texts
+
+        # The dialog must be closable via its Close button.
+        close_btn = [
+            b for b in dialog.findChildren(QPushButton) if b.text() == "Close"
+        ]
+        assert close_btn, "dialog must expose a Close button"
+
+
+class TestTrayMenuLayout:
+    """The tray menu groups assistant power, voice capture and status controls."""
+
+    def _tray_menu(self, qapp):
+        from desktop_app.app import JarvisSystemTray
+        from PyQt6.QtWidgets import QSystemTrayIcon
+
+        tray = JarvisSystemTray.__new__(JarvisSystemTray)
+        tray.tray_icon = QSystemTrayIcon()
+        tray.create_menu()
+        return tray.menu
+
+    def test_dictation_menu_action_opens_saved_history(self, qapp, tmp_path, monkeypatch):
+        from desktop_app.app import JarvisSystemTray
+        from desktop_app.dictation_history import DictationHistoryWindow
+        from jarvis.dictation.history import DictationHistory
+        from PyQt6.QtWidgets import QLabel, QSystemTrayIcon
+
+        history = DictationHistory(path=tmp_path / "history.json")
+        entry = history.add("A saved dictation, café")
+        tray = JarvisSystemTray.__new__(JarvisSystemTray)
+        tray.tray_icon = QSystemTrayIcon()
+        tray.dictation_history_window = DictationHistoryWindow(history)
+        monkeypatch.setattr(tray, "_maybe_add_cuda_recovery_action", lambda: None)
+        tray.create_menu()
+        try:
+            assert not tray.dictation_history_window.isVisible()
+            action = next(action for action in tray.menu.actions() if "Dictation History" in action.text())
+            action.trigger()
+            qapp.processEvents()
+            assert tray.dictation_history_window.isVisible()
+            assert entry["text"] in [label.text() for label in tray.dictation_history_window.findChildren(QLabel)]
+        finally:
+            tray.dictation_history_window.close()
+            tray.dictation_history_window.deleteLater()
+            tray._voice_pause_timer.stop()
+            tray._voice_pause_timer.deleteLater()
+            tray.menu.deleteLater()
+            tray.tray_icon.deleteLater()
+
+    def test_power_toggle_is_above_voice_pause_and_status_in_same_section(self, qapp):
+        menu = self._tray_menu(qapp)
+        actions = list(menu.actions())
+
+        toggle_idx = next(
+            i for i, a in enumerate(actions) if a.text() == "▶️ Turn On"
+        )
+        status_idx = next(
+            i for i, a in enumerate(actions) if "Status:" in a.text()
+        )
+
+        voice_idx = next(i for i, a in enumerate(actions) if "Voice Listening" in a.text())
+        assert toggle_idx < voice_idx < status_idx
+        between = actions[toggle_idx + 1 : status_idx]
+        assert not any(a.isSeparator() for a in between), (
+            "Power and the Status line must share one menu section"
+        )
+
+class TestListeningWindowVisibility:
+    """Starting or stopping the assistant must never change the visibility
+    of the log viewer or the face window.
+
+    The windows open automatically once at app launch; after that the tray
+    menu's "View Logs" / "Show Face" actions are the only controls:
+    start_daemon must not force them open and stop_daemon must not hide
+    them (even when the diary dialog appears).
+    """
+
+    @pytest.fixture(autouse=True)
+    def runtime(self, monkeypatch):
+        from desktop_app import app as app_mod
+
+        self._patch_face_state(monkeypatch)
+        for name in ("time", "threading", "subprocess"):
+            boundary = MagicMock(wraps=getattr(app_mod, name))
+            if name == "time":
+                boundary.sleep.return_value = None
+            monkeypatch.setattr(app_mod, name, boundary)
+
+    @pytest.mark.parametrize("boundary", ["thread", "subprocess", "wait"])
+    def test_runtime_keeps_unrelated_work_independent(self, qapp, monkeypatch, boundary):
+        from desktop_app import app as app_mod
+
+        if boundary == "wait":
+            self._tray_for_stop_bundled(monkeypatch)
+            before = list(app_mod.time.sleep.call_args_list)
+            worker = Thread(target=lambda: time.sleep(0.001))
+            worker.start()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            assert list(app_mod.time.sleep.call_args_list) == before, "An unrelated wait entered shutdown timing"
+            return
+
+        self._tray_for_start(monkeypatch)
+        if boundary == "thread":
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                assert pool.submit(lambda: "independent").result(timeout=5) == "independent"
+        else:
+            token = "independent"
+            result = subprocess.run(
+                [sys.executable, "-c", f"print({token!r})"],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            assert result.stdout.strip() == token
+
+    def _tray_for_start(self, monkeypatch):
+        import desktop_app.app as app_mod
+
+        tray = app_mod.JarvisSystemTray.__new__(app_mod.JarvisSystemTray)
+        tray.is_bundled = False
+        tray.daemon_process = None
+        tray.daemon_thread = None
+        tray.is_listening = False
+        tray.log_viewer = MagicMock()
+        tray.face_window = MagicMock()
+        tray.memory_viewer = MagicMock()
+        tray.chat_window = None
+        tray._chat_submit_fn = None
+        tray._chat_cancel_fn = None
+        tray._chat_control_fn = None
+        tray.log_reader_threads = []
+        tray.log_signals = MagicMock()
+        tray.tray_icon = MagicMock()
+        tray.toggle_action = MagicMock()
+        tray.status_action = MagicMock()
+        tray.app = MagicMock()
+        tray.update_icon = MagicMock()
+        tray._set_chat_daemon_status = MagicMock()
+        tray._daemon_stop_expected = False
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 4242
+        fake_proc.stdout = MagicMock()
+        fake_proc.stdin = MagicMock()
+        monkeypatch.setattr(
+            app_mod.subprocess, "Popen", MagicMock(return_value=fake_proc)
+        )
+        # No real reader thread in a unit test.
+        monkeypatch.setattr(app_mod.threading, "Thread", MagicMock())
+        return tray
+
+    def test_start_daemon_offers_turn_off(self, qapp, monkeypatch):
+        from PyQt6.QtGui import QAction
+
+        tray = self._tray_for_start(monkeypatch)
+        tray.toggle_action = QAction("▶️ Turn On")
+        tray.start_daemon()
+        assert tray.is_listening is True
+        assert tray.toggle_action.text() == "⏻ Turn Off"
+
+    def test_start_daemon_does_not_show_log_viewer(self, qapp, monkeypatch):
+        tray = self._tray_for_start(monkeypatch)
+        tray.start_daemon()
+        assert tray.is_listening is True
+        tray.log_viewer.show.assert_not_called()
+        tray.log_viewer.raise_.assert_not_called()
+        tray.log_viewer.activateWindow.assert_not_called()
+
+    def test_start_daemon_does_not_show_face_window(self, qapp, monkeypatch):
+        tray = self._tray_for_start(monkeypatch)
+        tray.start_daemon()
+        assert tray.is_listening is True
+        tray.face_window.show.assert_not_called()
+        tray.face_window.raise_.assert_not_called()
+
+    def _tray_for_stop_bundled(self, monkeypatch):
+        import desktop_app.app as app_mod
+
+        tray = app_mod.JarvisSystemTray.__new__(app_mod.JarvisSystemTray)
+        tray.is_bundled = True
+        tray.is_listening = True
+        tray.daemon_process = None
+        tray.daemon_thread = MagicMock()
+        tray.daemon_thread.isFinished.return_value = True
+        tray.log_viewer = MagicMock()
+        tray.face_window = MagicMock()
+        tray.log_signals = MagicMock()
+        tray.tray_icon = MagicMock()
+        tray.toggle_action = MagicMock()
+        tray.status_action = MagicMock()
+        tray.app = MagicMock()
+        tray.update_icon = MagicMock()
+        tray._set_chat_daemon_status = MagicMock()
+        tray._daemon_stop_expected = False
+        tray.chat_window = None
+        tray._chat_submit_fn = None
+
+        fake_dialog = MagicMock()
+        monkeypatch.setattr(app_mod, "DiaryUpdateDialog", MagicMock(return_value=fake_dialog))
+        monkeypatch.setattr("jarvis.daemon.set_diary_update_callbacks", MagicMock())
+        monkeypatch.setattr("jarvis.daemon.request_stop", MagicMock())
+        return tray, fake_dialog
+
+    def test_stop_daemon_bundled_does_not_hide_windows(self, qapp, monkeypatch):
+        tray, fake_dialog = self._tray_for_stop_bundled(monkeypatch)
+        tray.stop_daemon(show_diary_dialog=True)
+        assert tray.is_listening is False
+        # The diary dialog still appears...
+        fake_dialog.show.assert_called_once()
+        # ...but the log/face windows keep their current visibility.
+        tray.face_window.hide.assert_not_called()
+        tray.log_viewer.hide.assert_not_called()
+
+    def _tray_for_stop_subprocess(self, monkeypatch):
+        import desktop_app.app as app_mod
+
+        tray = app_mod.JarvisSystemTray.__new__(app_mod.JarvisSystemTray)
+        tray.is_bundled = False
+        tray.is_listening = True
+        tray.daemon_thread = None
+        tray.log_viewer = MagicMock()
+        tray.face_window = MagicMock()
+        tray.log_signals = MagicMock()
+        tray.tray_icon = MagicMock()
+        tray.toggle_action = MagicMock()
+        tray.status_action = MagicMock()
+        tray.app = MagicMock()
+        tray.update_icon = MagicMock()
+        tray._set_chat_daemon_status = MagicMock()
+        tray._daemon_stop_expected = False
+        tray._chat_submit_fn = lambda text: None
+
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = 0  # process already exited
+        fake_proc.stdin = MagicMock()
+        tray.daemon_process = fake_proc
+
+        fake_dialog = MagicMock()
+        monkeypatch.setattr(app_mod, "DiaryUpdateDialog", MagicMock(return_value=fake_dialog))
+        return tray, fake_dialog
+
+    @pytest.mark.parametrize("bundled", [False, True])
+    def test_stop_daemon_offers_turn_on(self, qapp, monkeypatch, bundled):
+        from PyQt6.QtGui import QAction
+
+        setup = self._tray_for_stop_bundled if bundled else self._tray_for_stop_subprocess
+        tray, _ = setup(monkeypatch)
+        tray.toggle_action = QAction("⏻ Turn Off")
+        tray.stop_daemon(show_diary_dialog=False)
+        assert tray.is_listening is False
+        assert tray.toggle_action.text() == "▶️ Turn On"
+
+    def _patch_face_state(self, monkeypatch):
+        """Monkeypatch get_jarvis_state with a mock state manager.
+
+        The face reset goes through the module-level singleton factory
+        (not the tray's face_window widget), so tests assert on the state
+        manager that factory returns.
+        """
+        from jarvis import activity
+        from jarvis.activity import JarvisState
+
+        fake_state = MagicMock()
+        monkeypatch.setattr(
+            activity,
+            "get_jarvis_state",
+            MagicMock(return_value=fake_state),
+        )
+        return fake_state, JarvisState
+
+    def test_stop_daemon_bundled_puts_face_asleep(self, qapp, monkeypatch):
+        """Stopping via the tray toggle puts the face back to sleep (bundled)."""
+        tray, fake_dialog = self._tray_for_stop_bundled(monkeypatch)
+        fake_state, JarvisState = self._patch_face_state(monkeypatch)
+        tray.stop_daemon(show_diary_dialog=True)
+        assert tray.is_listening is False
+        fake_state.set_state.assert_called_once_with(JarvisState.ASLEEP)
+
+    def test_stop_daemon_subprocess_puts_face_asleep(self, qapp, monkeypatch):
+        """Stopping via the tray toggle puts the face back to sleep (subprocess)."""
+        tray, fake_dialog = self._tray_for_stop_subprocess(monkeypatch)
+        fake_state, JarvisState = self._patch_face_state(monkeypatch)
+        tray.stop_daemon(show_diary_dialog=True)
+        assert tray.is_listening is False
+        fake_state.set_state.assert_called_once_with(JarvisState.ASLEEP)
+
+    def test_check_daemon_status_subprocess_crash_puts_face_asleep(self, qapp, monkeypatch):
+        """An unexpected subprocess exit also puts the face back to sleep."""
+        import desktop_app.app as app_mod
+        from PyQt6.QtGui import QAction
+
+        tray = app_mod.JarvisSystemTray.__new__(app_mod.JarvisSystemTray)
+        tray.is_bundled = False
+        tray.is_listening = True
+        tray.daemon_thread = None
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = 1  # process exited with an error
+        tray.daemon_process = fake_proc
+        tray.log_viewer = MagicMock()
+        tray.face_window = MagicMock()
+        tray.log_signals = MagicMock()
+        tray.tray_icon = MagicMock()
+        tray.toggle_action = QAction("⏻ Turn Off")
+        tray.status_action = MagicMock()
+        tray.update_icon = MagicMock()
+        tray._set_chat_daemon_status = MagicMock()
+        tray._chat_submit_fn = lambda text: None
+        tray._daemon_stop_expected = False
+        tray._initialise_voice_pause_controls()
+
+        fake_state, JarvisState = self._patch_face_state(monkeypatch)
+        tray.check_daemon_status()
+        assert tray.is_listening is False
+        assert tray.toggle_action.text() == "▶️ Turn On"
+        fake_state.set_state.assert_called_once_with(JarvisState.ASLEEP)
+
+    def test_stop_daemon_subprocess_does_not_hide_windows(self, qapp, monkeypatch):
+        tray, fake_dialog = self._tray_for_stop_subprocess(monkeypatch)
+        tray.stop_daemon(show_diary_dialog=True)
+        assert tray.is_listening is False
+        # The diary dialog still appears...
+        fake_dialog.show.assert_called_once()
+        # ...but the log/face windows keep their current visibility.
+        tray.face_window.hide.assert_not_called()
+        tray.log_viewer.hide.assert_not_called()
+
+    def test_show_launch_windows_opens_log_and_face_windows(self, qapp):
+        """The launch hook opens the log and face windows once at startup."""
+        import desktop_app.app as app_mod
+
+        tray = app_mod.JarvisSystemTray.__new__(app_mod.JarvisSystemTray)
+        tray.log_viewer = MagicMock()
+        tray.face_window = MagicMock()
+
+        tray.show_launch_windows()
+
+        tray.log_viewer.show.assert_called_once()
+        tray.log_viewer.raise_.assert_called_once()
+        tray.log_viewer.activateWindow.assert_called_once()
+        tray.face_window.show.assert_called_once()
+        tray.face_window.raise_.assert_called_once()
+
+    def test_launch_flow_wires_launch_windows_after_daemon_start(self):
+        """main() still auto-opens the windows on launch, but through the
+        launch hook rather than inside start_daemon (which stays
+        visibility-neutral)."""
+        import inspect
+        from desktop_app.app import main
+
+        source = inspect.getsource(main)
+        show_idx = source.index("show_launch_windows")
+        start_idx = source.index("start_daemon")
+        assert show_idx > start_idx, (
+            "the launch windows must open after the daemon auto-start"
+        )

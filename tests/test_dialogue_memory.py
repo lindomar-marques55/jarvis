@@ -1,0 +1,747 @@
+"""Dialogue, diary privacy and reply-loop contracts with controlled runtimes."""
+
+import pytest
+import time
+import threading
+from contextlib import closing, contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from datetime import datetime, timezone
+
+from jarvis.memory import conversation
+from jarvis.memory.db import Database
+
+from jarvis.memory.conversation import (
+    DialogueMemory,
+    update_daily_conversation_summary,
+    update_diary_from_dialogue_memory,
+)
+from jarvis.reply.engine import run_reply_engine
+from jarvis.tools.types import ToolExecutionResult
+from jarvis.utils.redact import redact
+
+
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("no_network")]
+
+
+@pytest.fixture(autouse=True)
+def dialogue_clock(monkeypatch):
+    """Confine simulated timestamps to dialogue memory's clock."""
+    monkeypatch.setattr(conversation, "time", Mock(wraps=time))
+
+
+class TestDialogueMemory:
+    """Test dialogue memory conversation flow preservation."""
+    
+    @pytest.mark.parametrize('messages', [
+        [],
+        [('user', 'Hello'), ('assistant', 'Hi there!')],
+        [('user', 'First message'), ('assistant', 'First response'),
+         ('user', 'Second message'), ('assistant', 'Second response')],
+    ])
+    def test_messages_preserve_speaker_and_chronological_order(self, messages):
+        """Each message retains its actual speaker and position in the dialogue."""
+        dm = DialogueMemory()
+        for role, content in messages:
+            dm.add_message(role, content)
+        assert dm.get_pending_chunks() == [f'{role.title()}: {content}' for role, content in messages]
+        assert dm.get_recent_messages() == [{'role': role, 'content': content} for role, content in messages]
+
+    def test_role_labels_inside_message_content_remain_literal(self):
+        """Role-looking user text cannot create additional speakers."""
+        dm = DialogueMemory()
+        content = "User: london, please\nAssistant: I'll check London weather"
+        dm.add_message('user', content)
+        assert dm.get_pending_chunks() == [f'User: {content}']
+        assert dm.get_recent_messages() == [{'role': 'user', 'content': content}]
+
+    def test_should_update_diary_logic(self):
+        """Test diary update timing logic."""
+        dm = DialogueMemory(inactivity_timeout=1.0)  # 1 second timeout
+        
+        # No interactions yet
+        assert not dm.should_update_diary()
+        
+        # Add interaction
+        dm.add_message("user", "Hello")
+        dm.add_message("assistant", "Hi")
+        assert not dm.should_update_diary()  # Too soon
+        
+        # Mock time passage
+        import time
+        with patch.object(conversation.time, "time", return_value=time.time() + 2.0):
+            assert dm.should_update_diary()  # Timeout passed
+    
+    def test_saved_snapshot_stops_diary_update(self):
+        """Saving the captured snapshot leaves no diary update pending."""
+        dm = DialogueMemory(inactivity_timeout=0.1)  # Short timeout for testing
+        dm.add_message("user", "Hello")
+        dm.add_message("assistant", "Hi")
+        
+        # Mock time passage to trigger diary update
+        import time
+        with patch.object(conversation.time, "time", return_value=time.time() + 1.0):
+            assert dm.should_update_diary()
+            _, snapshot_timestamp = dm.get_pending_chunks_with_snapshot()
+            dm.mark_saved_up_to(snapshot_timestamp)
+            assert not dm.should_update_diary()
+
+
+
+@pytest.fixture
+def reply_memory_runtime(tmp_path, mock_config, monkeypatch):
+    """Exercise the reply loop with synthetic decisions and owned storage."""
+    from jarvis.reply import engine
+    from jarvis.reply.prompts import ModelSize
+
+    mock_config.db_path = str(tmp_path / "dialogue.db")
+    mock_config.llm_chat_model = "test"
+    mock_config.ollama_chat_model = "test"
+    mock_config.embedding_model = ""
+    mock_config.location_enabled = False
+    mock_config.memory_enrichment_source = "diary"
+    mock_config.memory_digest_enabled = False
+    mock_config.tool_result_digest_enabled = False
+    monkeypatch.setattr(engine, "detect_model_size", lambda *args, **kwargs: ModelSize.LARGE)
+    monkeypatch.setattr(engine, "select_tools", lambda **kwargs: list(kwargs["builtin_tools"]))
+    monkeypatch.setattr(engine, "plan_query", lambda *args, **kwargs: [])
+    monkeypatch.setattr(engine, "extract_search_params_for_memory", lambda *args, **kwargs: {})
+    with closing(Database(mock_config.db_path)) as db:
+        yield db, mock_config
+
+
+class TestReplyEngineDialogueMemory:
+    """Test reply engine dialogue memory integration."""
+    
+    @patch('jarvis.reply.engine.chat_with_messages')
+    def test_dialogue_memory_preserves_message_order(self, mock_chat, reply_memory_runtime):
+        """Test that reply engine stores conversation in correct order."""
+        # Mock dependencies
+        mock_chat.return_value = {"message": {"content": "Final response"}}
+
+        db, cfg = reply_memory_runtime
+
+        # Create dialogue memory
+        dialogue_memory = DialogueMemory()
+        
+        # Run reply engine
+        result = run_reply_engine(
+            db=db,
+            cfg=cfg,
+            tts=None,
+            text="What's the weather in London?",
+            dialogue_memory=dialogue_memory
+        )
+        
+        # Check that dialogue memory was updated
+        chunks = dialogue_memory.get_pending_chunks()
+        assert len(chunks) == 2  # Now stores individual messages
+        
+        # Check that both messages are stored correctly
+        assert "User: What's the weather in London?" in chunks
+        assert "Assistant: Final response" in chunks
+    
+    @patch('jarvis.reply.engine.chat_with_messages')
+    @patch('jarvis.reply.engine.run_tool_with_retries')
+    def test_dialogue_memory_filters_tool_calls(self, mock_tool, mock_chat, reply_memory_runtime):
+        """Test that JSON tool calls are filtered from dialogue memory."""
+        # Mock dependencies
+        mock_tool.return_value = ToolExecutionResult(success=True, reply_text="Weather data")
+        
+        # Mock multi-turn conversation: structured tool call then final response
+        mock_chat.side_effect = [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_12345",
+                        "function": {
+                            "name": "webSearch",
+                            "arguments": {"query": "London weather"}
+                        }
+                    }]
+                }
+            },
+            {"message": {"content": "It's sunny in London today!"}}
+        ]
+        db, cfg = reply_memory_runtime
+
+        # Create dialogue memory
+        dialogue_memory = DialogueMemory()
+
+        # Run reply engine
+        result = run_reply_engine(
+            db=db,
+            cfg=cfg,
+            tts=None,
+            text="What's the weather in London?",
+            dialogue_memory=dialogue_memory
+        )
+
+        # Tool output reaches the response model without becoming dialogue text.
+        response_messages = mock_chat.call_args_list[-1].kwargs["messages"]
+        assert any(
+            message.get("role") == "tool"
+            and message.get("tool_call_id") == "call_12345"
+            and "Weather data" in message.get("content", "")
+            for message in response_messages
+        )
+
+        # Check that dialogue memory was updated
+        chunks = dialogue_memory.get_pending_chunks()
+        assert len(chunks) == 2  # User message and assistant response stored separately
+
+        # Should include user input and final response
+        assert "User: What's the weather in London?" in chunks
+        assert "Assistant: It's sunny in London today!" in chunks
+
+        # Should NOT include the tool call
+        for chunk in chunks:
+            assert 'call_12345' not in chunk
+
+
+
+@pytest.fixture
+def diary_redaction_runtime(tmp_path, mock_config):
+    """Own the diary database with embeddings disabled."""
+    mock_config.llm_chat_model = "test"
+    mock_config.ollama_chat_model = "test"
+    mock_config.embedding_model = ""
+    mock_config.ollama_embed_model = "test"
+    with closing(Database(str(tmp_path / "diary.db"))) as db:
+        yield db, mock_config
+
+
+def _assert_diary_saved(db, result):
+    assert result is not None
+    saved = db.get_conversation_summary_by_id(result)
+    assert saved["summary"] == "Daily summary"
+    assert saved["topics"] == "topic1, topic2"
+    assert saved["source_app"] == "test"
+
+
+class TestDiaryRedaction:
+    """Test diary redaction functionality."""
+    
+    def test_redact_sensitive_info(self):
+        """Test that sensitive information is properly redacted."""
+        sensitive_text = "My email is user@example.com and my apikey: sk-abcd1234567890abcdef"
+        redacted = redact(sensitive_text)
+        
+        assert "[REDACTED_EMAIL]" in redacted
+        assert "[REDACTED]" in redacted  # API key pattern uses different format
+        assert "user@example.com" not in redacted
+        assert "sk-abcd1234567890abcdef" not in redacted
+    
+    @patch('jarvis.memory.conversation.generate_conversation_summary')
+    def test_diary_update_redacts_chunks(self, mock_summary, diary_redaction_runtime):
+        """Test that diary updates redact sensitive information from chunks."""
+        # Mock summary generation
+        mock_summary.return_value = ("Daily summary", "topic1, topic2")
+        
+        db, cfg = diary_redaction_runtime
+        
+        # Create chunks with sensitive information
+        sensitive_chunks = [
+            "User: My email is sensitive@example.com",
+            "Assistant: I'll help you with that",
+            "User: Here's my apikey: sk-abcdef123456"
+        ]
+        
+        # Call diary update function
+        result = update_daily_conversation_summary(
+            db=db,
+            new_chunks=sensitive_chunks,
+            cfg=cfg,
+            source_app="test",
+        )
+
+        _assert_diary_saved(db, result)
+
+        # Verify summary was called with redacted chunks
+        mock_summary.assert_called_once()
+        redacted_chunks = mock_summary.call_args[0][0]  # First argument to generate_conversation_summary
+        
+        # Check that sensitive info was redacted
+        redacted_text = " ".join(redacted_chunks)
+        assert "[REDACTED_EMAIL]" in redacted_text
+        assert "[REDACTED]" in redacted_text  # API key pattern uses different format
+        assert "sensitive@example.com" not in redacted_text
+        assert "sk-abcdef123456" not in redacted_text
+    
+    @patch('jarvis.memory.conversation.generate_conversation_summary')
+    def test_diary_update_preserves_conversation_flow(self, mock_summary, diary_redaction_runtime):
+        """Test that diary updates preserve conversation order after redaction."""
+        # Mock summary generation
+        mock_summary.return_value = ("Daily summary", "topic1, topic2")
+        
+        db, cfg = diary_redaction_runtime
+        
+        # Create ordered conversation chunks
+        chunks = [
+            "User: Hello there",
+            "Assistant: Hi! How can I help?",
+            "User: What's the weather?",
+            "Assistant: Let me check for you"
+        ]
+        
+        # Call diary update function
+        result = update_daily_conversation_summary(
+            db=db,
+            new_chunks=chunks,
+            cfg=cfg,
+            source_app="test",
+        )
+        
+        _assert_diary_saved(db, result)
+
+        # Verify summary was called with chunks in correct order
+        mock_summary.assert_called_once()
+        processed_chunks = mock_summary.call_args[0][0]  # First argument
+        
+        assert len(processed_chunks) == 4
+        assert processed_chunks[0] == "User: Hello there"
+        assert processed_chunks[1] == "Assistant: Hi! How can I help?"
+        assert processed_chunks[2] == "User: What's the weather?"
+        assert processed_chunks[3] == "Assistant: Let me check for you"
+
+
+class TestDialogueMemoryIntegration:
+    """Integration tests for dialogue memory with redaction."""
+    
+    def test_full_flow_with_sensitive_data(self):
+        """Test complete flow from dialogue memory to redacted diary."""
+        # Create dialogue memory with sensitive information
+        dm = DialogueMemory()
+        messages = [
+            ('user', 'My email is test@example.com'),
+            ('assistant', 'I can help with that'),
+            ('user', "Here's my apikey: sk-1234567890"),
+            ('assistant', "Thanks, I'll process that securely"),
+        ]
+        for role, content in messages:
+            dm.add_message(role, content)
+        chunks = dm.get_pending_chunks()
+        assert chunks == [f'{role.title()}: {content}' for role, content in messages]
+        assert 'test@example.com' in '\n'.join(chunks)
+        assert 'sk-1234567890' in '\n'.join(chunks)
+
+        # Simulate diary update redaction
+        redacted_chunks = [redact(chunk) for chunk in chunks]
+        redacted_content = "\n".join(redacted_chunks)
+        
+        # Verify redaction worked
+        assert "[REDACTED_EMAIL]" in redacted_content
+        assert "[REDACTED]" in redacted_content  # API key pattern uses different format
+        assert "test@example.com" not in redacted_content
+        assert "sk-1234567890" not in redacted_content
+        
+        # Verify conversation flow is preserved
+        assert "User: My email is [REDACTED_EMAIL]" in redacted_content
+        assert "Assistant: I can help with that" in redacted_content
+        assert "apikey=[REDACTED]" in redacted_content
+        assert "Assistant: Thanks, I'll process that securely" in redacted_content
+
+
+class TestDialogueMemoryEdgeCases:
+    """Test edge cases for dialogue memory thread safety and long conversations."""
+
+    def test_thread_safety_concurrent_add_and_read(self):
+        """Test that concurrent add and read operations don't cause race conditions."""
+        dm = DialogueMemory()
+        errors = []
+        iterations = 100
+
+        def add_messages():
+            for i in range(iterations):
+                try:
+                    dm.add_message("user", f"Message {i}")
+                except Exception as e:
+                    errors.append(f"add_message error: {e}")
+
+        def read_messages():
+            for _ in range(iterations):
+                try:
+                    dm.get_recent_messages()
+                    dm.get_pending_chunks()
+                    dm.has_recent_messages()
+                except Exception as e:
+                    errors.append(f"read error: {e}")
+
+        # Run concurrent operations
+        threads = [
+            threading.Thread(target=add_messages),
+            threading.Thread(target=read_messages),
+            threading.Thread(target=add_messages),
+            threading.Thread(target=read_messages),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Thread safety errors: {errors}"
+
+    @pytest.mark.parametrize('clock', [0.0, 1_000_000_000.0])
+    @pytest.mark.parametrize('later_count', [0, 1, 2])
+    def test_saved_snapshot_preserves_later_messages_with_a_stationary_clock(self, monkeypatch, clock, later_count):
+        """Saving a snapshot excludes later arrivals even within one clock tick."""
+        monkeypatch.setattr(conversation.time, "time", lambda: clock)
+        dm = DialogueMemory()
+        dm.add_message('user', 'First message')
+        dm.add_message('assistant', 'First response')
+        chunks, snapshot_timestamp = dm.get_pending_chunks_with_snapshot()
+        assert chunks == ['User: First message', 'Assistant: First response']
+
+        later = [f'Later message {i}' for i in range(later_count)]
+        for message in later:
+            dm.add_message('user', message)
+        dm.mark_saved_up_to(snapshot_timestamp)
+
+        assert dm.get_pending_chunks() == [f'User: {message}' for message in later]
+        assert dm.has_pending_chunks() == bool(later)
+
+    def test_long_conversation_forces_diary_update(self):
+        """Test that very long conversations force diary update to prevent data loss."""
+        dm = DialogueMemory(inactivity_timeout=300.0)  # 5 minute inactivity timeout
+
+        # Add a message and simulate it being old (older than MAX_UNSAVED_AGE_SEC)
+        dm.add_message("user", "Old message")
+
+        # Manually adjust the message timestamp to be old
+        with dm._lock:
+            ts, role, content = dm._messages[0]
+            # Make it older than MAX_UNSAVED_AGE_SEC (which equals inactivity_timeout)
+            old_ts = time.time() - (dm.MAX_UNSAVED_AGE_SEC + 60)
+            dm._messages[0] = (old_ts, role, content)
+
+        # Should trigger diary update even though user is "active" (recent _last_activity_time)
+        assert dm.should_update_diary()
+
+    def test_long_conversation_does_not_force_if_recent(self):
+        """Test that recent messages don't trigger forced diary update."""
+        dm = DialogueMemory(inactivity_timeout=300.0)
+
+        # Add a recent message
+        dm.add_message("user", "Recent message")
+
+        # Should not trigger diary update (not inactive and not too old)
+        assert not dm.should_update_diary()
+
+    def test_cleanup_removes_old_saved_messages(self):
+        """Test that old saved messages are cleaned up from memory."""
+        dm = DialogueMemory()
+
+        # Add messages
+        dm.add_message("user", "Message 1")
+        time.sleep(0.01)
+        dm.add_message("user", "Message 2")
+
+        # Mark all as saved
+        _, snapshot_timestamp = dm.get_pending_chunks_with_snapshot()
+        dm.mark_saved_up_to(snapshot_timestamp)
+
+        # Manually make messages old (beyond RECENT_WINDOW_SEC)
+        with dm._lock:
+            old_ts = time.time() - (dm.RECENT_WINDOW_SEC + 60)
+            dm._messages = [
+                (old_ts, role, content) for _, role, content in dm._messages
+            ]
+            dm._cleanup_old_messages()
+
+        # Old saved messages should be removed
+        assert len(dm._messages) == 0
+
+    def test_cleanup_keeps_unsaved_old_messages(self):
+        """Test that old unsaved messages are NOT cleaned up (needed for diary)."""
+        dm = DialogueMemory()
+
+        # Add messages
+        dm.add_message("user", "Unsaved message")
+
+        # Manually make message old but don't mark as saved
+        with dm._lock:
+            old_ts = time.time() - (dm.RECENT_WINDOW_SEC + 60)
+            dm._messages = [
+                (old_ts, role, content) for _, role, content in dm._messages
+            ]
+            dm._cleanup_old_messages()
+
+        # Old unsaved messages should still exist (needed for diary update)
+        assert len(dm._messages) == 1
+
+    def test_has_pending_chunks(self):
+        """Test has_pending_chunks method."""
+        dm = DialogueMemory()
+
+        # No messages yet
+        assert not dm.has_pending_chunks()
+
+        # Add message
+        dm.add_message("user", "Hello")
+        assert dm.has_pending_chunks()
+
+        # Mark as saved
+        _, snapshot_timestamp = dm.get_pending_chunks_with_snapshot()
+        dm.mark_saved_up_to(snapshot_timestamp)
+        assert not dm.has_pending_chunks()
+
+    def test_should_update_diary_returns_false_when_no_pending(self):
+        """Test that should_update_diary returns False when no pending chunks."""
+        dm = DialogueMemory(inactivity_timeout=0.1)
+
+        # No messages
+        assert not dm.should_update_diary()
+
+        # Add and save messages
+        dm.add_message("user", "Hello")
+        _, snapshot_timestamp = dm.get_pending_chunks_with_snapshot()
+        dm.mark_saved_up_to(snapshot_timestamp)
+
+        # Even after timeout, should return False if no pending
+        time.sleep(0.15)
+        assert not dm.should_update_diary()
+
+    def test_get_pending_chunks_with_snapshot_empty(self):
+        """Snapshot on a fresh DialogueMemory returns empty chunks and zero timestamp."""
+        dm = DialogueMemory()
+        chunks, ts = dm.get_pending_chunks_with_snapshot()
+        assert chunks == []
+        assert ts == 0.0
+
+    def test_get_pending_chunks_with_snapshot_returns_unsaved_messages(self):
+        """Snapshot returns chunks for unsaved messages in role.title() format."""
+        dm = DialogueMemory()
+        dm.add_message("user", "Hello")
+        dm.add_message("assistant", "Hi there")
+        chunks, _ = dm.get_pending_chunks_with_snapshot()
+        assert len(chunks) == 2
+        assert chunks[0] == "User: Hello"
+        assert chunks[1] == "Assistant: Hi there"
+
+    def test_get_pending_chunks_with_snapshot_excludes_saved_messages(self):
+        """Snapshot excludes messages already marked as saved."""
+        dm = DialogueMemory()
+        dm.add_message("user", "Old message")
+        _, snapshot_timestamp = dm.get_pending_chunks_with_snapshot()
+        dm.mark_saved_up_to(snapshot_timestamp)
+        dm.add_message("user", "New message")
+        chunks, _ = dm.get_pending_chunks_with_snapshot()
+        assert len(chunks) == 1
+        assert "New message" in chunks[0]
+
+    def test_get_pending_chunks_with_snapshot_monotonicity(self):
+        """Snapshot timestamp is strictly less than any message added afterwards."""
+        dm = DialogueMemory()
+        dm.add_message("user", "Before snapshot")
+        _, snapshot_ts = dm.get_pending_chunks_with_snapshot()
+        dm.add_message("user", "After snapshot")
+        # The message added after the snapshot must have a strictly greater timestamp.
+        after_ts = dm._messages[-1][0]
+        assert after_ts > snapshot_ts
+
+    def test_get_pending_chunks_with_snapshot_consistent_with_get_pending_chunks(self):
+        """get_pending_chunks() is consistent with get_pending_chunks_with_snapshot()."""
+        dm = DialogueMemory()
+        dm.add_message("user", "Hello")
+        dm.add_message("assistant", "World")
+        chunks_simple = dm.get_pending_chunks()
+        chunks_snapshot, _ = dm.get_pending_chunks_with_snapshot()
+        assert chunks_simple == chunks_snapshot
+
+    @patch('jarvis.memory.conversation.update_daily_conversation_summary')
+    def test_update_diary_preserves_new_messages_during_slow_llm(self, mock_summary):
+        """Integration test: messages arriving during slow LLM call are preserved."""
+        dm = DialogueMemory(inactivity_timeout=0.1)
+        mock_db = Mock()
+
+        # Add initial messages
+        dm.add_message("user", "Initial message")
+        dm.add_message("assistant", "Initial response")
+
+        # Simulate slow LLM call that takes time
+        def slow_summary(*args, **kwargs):
+            # Simulate user sending new message during LLM call
+            dm.add_message("user", "Message during LLM call")
+            return 123  # Return summary ID
+
+        mock_summary.return_value = 123
+        mock_summary.side_effect = slow_summary
+
+        # Wait for inactivity timeout
+        time.sleep(0.15)
+
+        # Run diary update
+        cfg = SimpleNamespace(
+            llm_chat_model="test",
+            ollama_base_url="http://localhost",
+            ollama_chat_model="test",
+            embedding_model="",
+            ollama_embed_model="test",
+        )
+        result = update_diary_from_dialogue_memory(
+            db=mock_db,
+            dialogue_memory=dm,
+            cfg=cfg,
+            force=True,
+        )
+
+        assert result == 123
+
+        # New message should still be pending
+        pending = dm.get_pending_chunks()
+        assert len(pending) == 1
+        assert "Message during LLM call" in pending[0]
+
+
+class TestDialogueMemoryUnifiedDurations:
+    """Test that DialogueMemory durations are unified from inactivity_timeout."""
+
+    def test_recent_window_matches_inactivity_timeout(self):
+        """Verify RECENT_WINDOW_SEC equals inactivity_timeout."""
+        dm = DialogueMemory(inactivity_timeout=300.0)
+        assert dm.RECENT_WINDOW_SEC == 300.0
+
+    def test_max_unsaved_age_matches_inactivity_timeout(self):
+        """Verify MAX_UNSAVED_AGE_SEC equals inactivity_timeout."""
+        dm = DialogueMemory(inactivity_timeout=300.0)
+        assert dm.MAX_UNSAVED_AGE_SEC == 300.0
+
+    def test_all_durations_unified(self):
+        """Verify all durations match the configured inactivity_timeout."""
+        dm = DialogueMemory(inactivity_timeout=600.0)
+        assert dm.RECENT_WINDOW_SEC == 600.0
+        assert dm.MAX_UNSAVED_AGE_SEC == 600.0
+
+    def test_custom_timeout_propagates(self):
+        """Verify a custom timeout drives all durations."""
+        dm = DialogueMemory(inactivity_timeout=120.0)
+        assert dm.RECENT_WINDOW_SEC == 120.0
+        assert dm.MAX_UNSAVED_AGE_SEC == 120.0
+
+
+
+
+class TestDialogueMemorySessions:
+    """Session archive / restore / rewind primitives backing the text-chat
+    sessions feature. Everything is in-memory only; these methods never
+    touch the diary or the disk."""
+
+    def _conversation(self):
+        dm = DialogueMemory()
+        dm.add_message("user", "remind me to buy oat milk")
+        dm.add_message("assistant", "Noted.")
+        dm.add_message("user", "what about eggs?")
+        dm.add_message("assistant", "Eggs too.")
+        return dm
+
+    def test_all_messages_returns_every_turn_in_order(self):
+        dm = self._conversation()
+        assert dm.all_messages() == [
+            {"role": "user", "content": "remind me to buy oat milk"},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "what about eggs?"},
+            {"role": "assistant", "content": "Eggs too."},
+        ]
+
+    def test_set_messages_restores_a_snapshot(self):
+        dm = self._conversation()
+        snapshot = dm.all_messages()
+
+        dm.clear()
+        dm.set_messages(snapshot[:2])
+
+        assert dm.all_messages() == snapshot[:2]
+        assert dm.has_recent_messages(), "restored turns must count as recent"
+
+    def test_set_messages_ignores_blank_entries(self):
+        dm = DialogueMemory()
+        dm.set_messages([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "   "},
+            {"role": "", "content": "hello"},
+        ])
+        assert dm.all_messages() == [{"role": "user", "content": "hi"}]
+
+    def test_clear_drops_conversation_and_caches(self):
+        dm = self._conversation()
+        dm.hot_cache_put("k", "v")
+        dm.record_tool_turn([{"role": "tool", "content": "x"}])
+
+        dm.clear()
+
+        assert dm.all_messages() == []
+        assert dm.hot_cache_get("k") is None
+        assert dm.get_recent_turns_with_tools() == []
+
+    def test_rewind_before_first_user_message_drops_everything(self):
+        dm = self._conversation()
+        assert dm.rewind_before_user_message(1) is True
+        assert dm.all_messages() == []
+
+    def test_rewind_before_second_user_message_keeps_first_turn(self):
+        dm = self._conversation()
+        assert dm.rewind_before_user_message(2) is True
+        assert dm.all_messages() == [
+            {"role": "user", "content": "remind me to buy oat milk"},
+            {"role": "assistant", "content": "Noted."},
+        ]
+
+    def test_rewind_to_unknown_user_index_is_a_noop(self):
+        dm = self._conversation()
+        assert dm.rewind_before_user_message(5) is False
+        assert len(dm.all_messages()) == 4
+
+    def test_rewind_clears_tool_carryover_and_hot_cache(self):
+        dm = self._conversation()
+        dm.hot_cache_put("router", "cached")
+        dm.record_tool_turn([{"role": "tool", "content": "x"}])
+
+        dm.rewind_before_user_message(2)
+
+        assert dm.hot_cache_get("router") is None
+        turns = dm.get_recent_turns_with_tools()
+        assert not any(m.get("role") == "tool" for m in turns), (
+            "tool carryover must be cleared by a rewind"
+        )
+
+
+@pytest.mark.parametrize("scenario,clock,later_count", [
+    ("idle", None, 0), ("saved", None, 0),
+] + [("stationary", clock, count)
+     for clock in (0.0, 1_000_000_000.0) for count in (0, 1, 2)])
+def test_dialogue_clock_preserves_native_worker_time(monkeypatch, scenario, clock, later_count):
+    """An unrelated worker retains its native clock during dialogue simulations."""
+    native_time = time.time
+    original_patch = patch
+    samples = []
+
+    def sample():
+        before = native_time()
+        observed = time.time()
+        return before, observed, native_time()
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        @contextmanager
+        def observe(context):
+            with context as value:
+                samples.append(worker.submit(sample).result(timeout=3))
+                yield value
+
+        recorder = Mock(side_effect=lambda *args, **kwargs: observe(original_patch(*args, **kwargs)))
+        recorder.object = lambda *args, **kwargs: observe(original_patch.object(*args, **kwargs))
+        monkeypatch.setitem(globals(), "patch", recorder)
+        if scenario == "idle":
+            TestDialogueMemory().test_should_update_diary_logic()
+        elif scenario == "saved":
+            TestDialogueMemory().test_saved_snapshot_stops_diary_update()
+        else:
+            TestDialogueMemoryEdgeCases().test_saved_snapshot_preserves_later_messages_with_a_stationary_clock(
+                monkeypatch, clock, later_count,
+            )
+        if not samples:
+            samples.append(worker.submit(sample).result(timeout=3))
+
+    assert all(min(before, after) <= observed <= max(before, after)
+               for before, observed, after in samples)

@@ -1,0 +1,329 @@
+"""
+Model-size-specific prompt variations.
+
+Small models (0.5B-7.5B) need explicit guidance on when NOT to use tools,
+while larger models can infer this from context.
+"""
+
+import re
+from enum import Enum
+from typing import Optional
+
+from .system import (
+    PromptComponents,
+    ASR_NOTE,
+    INFERENCE_GUIDANCE,
+    VOICE_STYLE,
+)
+
+
+class ModelSize(Enum):
+    """Classification of model sizes for prompt selection."""
+    SMALL = "small"  # 0.5B-7.5B - needs explicit tool constraints
+    LARGE = "large"  # 8B+ - can infer tool usage from context
+
+
+# Threshold in billions of parameters — models at or below this are SMALL.
+# Set at 7.5 (midpoint between 7B and 8B) so 7B models are SMALL and 8B+ are LARGE.
+_SMALL_MODEL_THRESHOLD = 7.5
+
+# Model families whose bare names (no size tag) should be treated as SMALL.
+# Sized variants follow the size threshold like any other model — e.g.
+# ``gemma4:12b`` is LARGE, only a bare ``gemma4`` (the 2B default) is SMALL.
+_SMALL_MODEL_FAMILIES = ("gemma4", "gemma-4")
+
+# Ollama advertises Qwen3 variants with native function/tool support, including
+# small parameter sizes. Keep their small-model prompts while using structured
+# tool calls instead of the more fragile text-tool protocol.
+_NATIVE_TOOL_CALLING_FAMILIES = ("qwen3",)
+
+# Regex to extract parameter count from a model name.
+#
+# Matches patterns like:
+#   :0.8b  :1b  :3b  :7b  :14b  :70b     — standard sizes
+#   :2.7b  :1.1b  :0.5b                    — decimal sizes
+#   model-3b-instruct  model_1b_chat       — common separators
+#   :8x7b  :8x22b                          — Mixture-of-Experts (MoE)
+#
+# Group 1: the base parameter count (float-compatible)
+# Group 2: if present, the MoE expert size — indicates a large MoE model
+_PARAM_REGEX = re.compile(
+    r"(\d+(?:\.\d+)?)(?:x(\d+))?b(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def detect_model_size(model_name: Optional[str]) -> ModelSize:
+    """
+    Detect model size by parsing the actual parameter count from the name.
+
+    Uses a regex to extract the parameter count (e.g. "0.8b", "7b", "14b")
+    and compares it against the SMALL_MODEL_THRESHOLD. MoE models (e.g.
+    "8x7b") are treated as LARGE since their total parameter count is much
+    higher. Gemma 4 variants with a known size tag follow the same threshold;
+    only bare Gemma 4 names with no size indicator default to SMALL.
+
+    Args:
+        model_name: Model name (e.g., "qwen3.5:0.8b", "qwen3.8:27b",
+                    "mixtral:8x7b")
+
+    Returns:
+        ModelSize.SMALL for models ≤7.5B parameters, ModelSize.LARGE otherwise
+    """
+    if not model_name:
+        return ModelSize.LARGE  # Default to large for safety
+
+    name_lower = model_name.lower()
+
+    # Extract parameter count from model name — this runs first so that
+    # known sizes are honoured even for Gemma 4 variants (e.g. a 12B Gemma 4
+    # should be treated as LARGE, not SMALL).
+    match = _PARAM_REGEX.search(name_lower)
+    if match:
+        # MoE format (e.g. "8x7b") — total parameters are much larger than the
+        # base number implies, so classify as LARGE
+        if match.group(2) is not None:
+            return ModelSize.LARGE
+
+        param_count = float(match.group(1))
+
+        if param_count <= _SMALL_MODEL_THRESHOLD:
+            return ModelSize.SMALL
+        else:
+            return ModelSize.LARGE
+
+    # No size indicator found. Fall back to model-family heuristics.
+    # Gemma 4 variants without an explicit size tag (e.g. bare "gemma4")
+    # are assumed to be the default small variant.
+    for family in _SMALL_MODEL_FAMILIES:
+        if family in name_lower:
+            return ModelSize.SMALL
+
+    return ModelSize.LARGE  # No size indicator found
+
+
+def supports_native_tool_calling(model_name: Optional[str]) -> bool:
+    """Return whether a known small model family supports structured tool calls."""
+    if not model_name:
+        return False
+    name = model_name.strip().lower().rsplit("/", 1)[-1]
+    family = name.split(":", 1)[0]
+    return any(
+        family == candidate or family.startswith(candidate + "-")
+        for candidate in _NATIVE_TOOL_CALLING_FAMILIES
+    )
+
+
+# =============================================================================
+# Large Model Prompts
+# =============================================================================
+
+TOOL_INCENTIVES_LARGE = (
+    "Proactively use available tools to provide better, more accurate responses. "
+    "Prefer tools over guessing when you can get definitive, current, or personalized information. "
+    "Tools enhance your capabilities - use them confidently to deliver superior assistance. "
+    "Always try tools before asking the user for information you might already be able to get via them."
+)
+
+TOOL_GUIDANCE_LARGE = (
+    "You have access to tools - use them proactively when you need current information or to perform actions. "
+    "After receiving tool results, use the data to FULFILL THE USER'S ORIGINAL REQUEST. "
+    "Do NOT describe the structure of tool responses - extract the relevant information and present it conversationally. "
+    "Tool results are raw data for you to interpret and use, not content to describe or explain. "
+    "CRITICAL fidelity rule: when you answer a question using a tool result, every specific fact in your "
+    "reply (names, dates, cast, authors, places, numbers, plot details, product specs) must come from the "
+    "tool result itself or from the user's own messages. Do NOT supplement tool results with cast, plot, "
+    "release years, authors, or other specifics from your prior — even if they feel plausible. If the tool "
+    "returned only a short summary, answer using only that summary; do not extend it with invented detail. "
+    "If the tool result doesn't contain what the user asked for, say so and offer to look up more rather "
+    "than filling the gap from memory. "
+    "When a webSearch result includes a '**Content from top result:**' section, quote its specific facts "
+    "(names, dates, roles, plot) rather than deferring to the '**Other search results:**' link list. "
+    "The links are provenance, not a substitute for an answer."
+)
+
+_AUTO_DERIVED_ARGUMENT_GUIDANCE = (
+    "ARGUMENTS THE TOOL CAN AUTO-DERIVE:\n"
+    "Explicit user values, including destinations resolved from an earlier "
+    "request, take precedence over profile and current-context defaults. "
+    "Prefer omitting optional auto-derived inputs when the user has not "
+    "requested a particular value, letting the tool resolve its defaults. "
+    "Any supplied value must come from the request or known context, never "
+    "a guess. Call the tool in the SAME turn with the requested "
+    "values, or with {} when none are supplied. For example, "
+    "weather here or tomorrow uses getWeather with {}; weather in Ankara "
+    "uses getWeather with {\"location\": \"Ankara\"}. Preserve named "
+    "destinations and geographic qualifiers. Location, time and profile "
+    "context contain input defaults, not live observations. Obtain the "
+    "requested data from an actual tool result before answering.\n\n"
+)
+
+
+# Large models also confabulate on named entities — e.g. qwen3.8:27b produces a
+# confident but wrong cast list for the film "Possessor" without calling
+# webSearch. The anti-confabulation rule is therefore not a small-model-only
+# concern. We keep a shorter version here (large models follow concise
+# instructions reliably; repetition and worked examples are only needed for
+# small models).
+#
+# NB: constraints are intentionally phrased without any language-specific
+# negative examples ("would you like me to", "if you'd like", etc.) because
+# this assistant supports an arbitrary set of languages. We describe the
+# BEHAVIOUR to avoid, not English tokens that happen to express it.
+TOOL_CONSTRAINTS_LARGE = (
+    "ACTION REQUESTS — NEVER REFUSE BEFORE CHECKING:\n"
+    "When the user asks for an action, scan your available tools and call the one whose "
+    "description covers that action. Do NOT apologise or claim you cannot do it. If "
+    "nothing in your current list fits, call `toolSearchTool` with a short description "
+    "of the action before giving up. A false refusal when a matching tool exists is the "
+    "worst possible reply.\n\n"
+    "CURRENT OPERATIONAL STATE:\n"
+    "When asked whether an application or service is currently running, open, or available, call a matching "
+    "status tool before answering. Never infer live state from training or prior replies.\n\n"
+    "UNKNOWN NAMED ENTITIES:\n"
+    "When the user asks about a specific named thing (a film, book, song, game, "
+    "product, person, company, place, event), call webSearch before answering unless "
+    "you can state concrete, verifiable facts about that exact entity with high confidence. "
+    "Do NOT confabulate cast, plot, release year, authors, or other specifics from a "
+    "plausible-sounding prior — if you are not certain, look it up. "
+    "A diary or memory entry mentioning the entity's name only confirms the topic came "
+    "up before; it does NOT give you facts you can restate. "
+    "Do not announce the search or ask permission — just call the tool, then answer. "
+    "Any phrasing that requests information about a named entity (\"tell me about X\", "
+    "\"have you heard of X\", and equivalents in any language) is a search trigger, "
+    "not a capability question about yourself.\n\n"
+    + _AUTO_DERIVED_ARGUMENT_GUIDANCE
+    + "SELF-CONTAINED TOOL ARGUMENTS:\n"
+    "When you call any tool with a free-form text argument (search queries, lookup "
+    "strings, question fields — whatever the tool calls them), the string you pass "
+    "must be a self-contained version of the user's intent. Resolve pronouns, "
+    "ellipsis, and implicit references from the conversation so far — the tool does "
+    "NOT see prior turns. If turn 1 was about Harry Styles and turn 2 asks \"what "
+    "are his most famous songs?\", the argument must name Harry Styles explicitly, "
+    "not echo the literal utterance. Prefer a compact keyword phrasing over a "
+    "conversational sentence: \"Harry Styles most famous songs\" beats \"what are "
+    "his most famous songs\". This applies to every tool you call, not just "
+    "webSearch."
+)
+
+
+# =============================================================================
+# Small Model Prompts
+# =============================================================================
+
+TOOL_INCENTIVES_SMALL = (
+    "You MUST call the right tool whenever one is available for what the user "
+    "is talking about. Your training knowledge is stale — tools give you "
+    "current, accurate data for weather, news, recent events, named-entity "
+    "facts, and any information that changes over time. Never answer a "
+    "question or make an observation about a topic a tool covers without "
+    "having called that tool first. "
+    "The only case where you respond without tools is when the user is "
+    "greeting you, giving you behavioural instructions, or making casual "
+    "chat with no information need — everything else demands a tool call."
+)
+
+TOOL_GUIDANCE_SMALL = (
+    "You have access to tools - use them when the task requires external data or actions. "
+    "After receiving tool results, use the data to answer the user's question conversationally. "
+    "Extract relevant information and present it naturally - never output raw JSON or data structures. "
+    "Tool results are YOUR OWN DATA to use when answering — they are not a new message from the user "
+    "and they are not a prompt for you to interpret. The user's question is in their earlier message "
+    "above the tool result; the tool result is the material you use to answer it. Do NOT reply by "
+    "describing the tool result back (\"the text is a collection of search results\", \"you have not "
+    "asked a specific question\", \"the provided text does not contain a direct question\") — the user "
+    "already asked their question and the tool already answered it, you just need to state the answer. "
+    "If the tool result contains facts that address the user's earlier question, synthesise those facts "
+    "into a direct answer. If it does not, say so briefly and offer to look further — never pretend no "
+    "question was asked. "
+    "CRITICAL fidelity rule: when answering using a tool result, every specific fact in your reply "
+    "(names, dates, cast, authors, places, plot details, numbers) must come from the tool result or "
+    "from the user's own messages. Do NOT add cast, plot, release years, authors, or other specifics "
+    "from your prior knowledge — even if they feel plausible. If the tool returned only a short summary, "
+    "answer using only that summary. If the result doesn't contain what the user asked, say so rather "
+    "than filling the gap from memory. "
+    "When a tool result contains a section labelled '**Content from top result:**', pull the specific "
+    "facts (names, dates, roles, plot, numbers) from that section and state them in your reply. Do NOT "
+    "defer to the '**Other search results:**' link list by saying things like 'here are some links' or "
+    "'sources like Wikipedia' — those links are for your reference only; the user wants the facts, not "
+    "the URLs. If the Content section has the answer, give it; only fall back to mentioning sources when "
+    "the Content section is empty or clearly off-topic."
+)
+
+# Explicit constraints for small models - focused specifically on the greeting case
+# without being overly restrictive on legitimate tool use.
+# NOTE: Repeated twice (x2) intentionally. Research shows repeating key instructions
+# improves instruction-following in smaller models.
+# See: "The Power of Noise: Redefining Retrieval for RAG Systems" (arXiv:2401.14887)
+# and "Lost in the Middle: How Language Models Use Long Contexts" (arXiv:2307.03172)
+# Repetition places the constraint both early (primacy) and late (recency) in the prompt.
+# NB: these constraints are intentionally phrased WITHOUT language-specific
+# examples of forbidden phrasing ("would you like me to", "I can search", etc.)
+# because this assistant supports an arbitrary set of languages. We describe
+# the BEHAVIOURS to avoid, not English tokens that happen to express them.
+# Small models still get enough structure to follow because each rule is
+# stated in imperative form with a concrete trigger + action.
+_TOOL_CONSTRAINTS_BASE = ("""ACTION REQUESTS — NEVER REFUSE BEFORE CHECKING:
+When the user asks for an action (open something, navigate somewhere, send a message, look something up, play something, fetch data), scan your available tools FIRST and call the one whose description covers that action. Do NOT apologise, do NOT say "I cannot do that", do NOT describe your limitations — just call the tool. If nothing in your current tool list obviously fits, call `toolSearchTool` with a short description of the action before giving up. A false refusal when a tool exists is the worst possible reply; calling a tool that turns out not to help is recoverable. Treat "I cannot" as a last resort reserved for when both your tool list AND `toolSearchTool` have been exhausted.
+
+GREETING HANDLING:
+When the user's message is a greeting or casual social phrase (whatever language), respond directly and warmly WITHOUT calling any tools. Greetings do not require external data.
+
+CURRENT OPERATIONAL STATE:
+When asked whether an application or service is currently running, open, or available, call a matching status tool before answering. Never infer live state from training or prior replies.
+
+WEATHER AND CURRENT CONDITIONS:
+When the user brings up weather, climate, temperature, or current conditions, whether as a question ("what is the weather like"), a statement ("it is nice today", "it is cold out there"), a contextual remark ("I am in London" after a prior weather exchange), or otherwise, call getWeather immediately. Do NOT offer an opinion, an observation, or a generic pleasantry about the weather before calling the tool. The tool provides the actual readings; your training data does not know today's temperature anywhere. Even a casual weather remark is a trigger for getWeather.
+
+USER INSTRUCTIONS:
+When the user gives you instructions about how to behave or respond (units, brevity, language, tone), acknowledge and respond directly WITHOUT calling tools. These are behavioural instructions, not data requests.
+
+UNKNOWN NAMED ENTITIES:
+If the user asks about a specific named thing (a film, book, song, game, product, person, company, place, event) and you do not have concrete factual information about that exact entity, call webSearch in the SAME turn — silently. Do not offer to search, do not ask permission to search, do not announce the search, do not say you have no information and stop. If the query names the entity clearly enough to search, SEARCH — do not ask the user to disambiguate first. Clarifying BEFORE a tool call is a deflection; clarifying AFTER the tool returns nothing useful is fine.
+
+Any phrasing that requests information about a named entity is a search trigger — the request doesn't have to contain the word "search". Treat "tell me about X", "tell me more about X", "what do you know about X", "what can you tell me about X", "have you heard of X", and their equivalents in any language as information requests about X, not as capability questions about yourself. The correct response is to look X up and answer — not to describe what you can or cannot do.
+
+Only skip the lookup if you can state concrete facts about the exact entity (title, year, creator, plot) without guessing. A diary or memory mention of the entity's name only confirms the topic came up — it does NOT give you facts you can state. Never invent plot, cast, release year, themes, or other specifics from prior knowledge. If you do not have facts from a tool result in this turn, you must call webSearch.
+
+"""
+    + _AUTO_DERIVED_ARGUMENT_GUIDANCE
+    + """SELF-CONTAINED TOOL ARGUMENTS:
+Whenever you call any tool with a free-form text argument (a search query, lookup string, question field — whatever the tool names it), the string you pass MUST be a self-contained restatement of the user's intent. Resolve pronouns, ellipsis, and implicit references from earlier turns yourself — the tool does NOT see the conversation history, it only sees the argument you pass. If the previous turn was about "Harry Styles" and the user now asks "what are his most famous songs?", the argument must be something like "Harry Styles most famous songs", NOT "what are his most famous songs". Prefer a compact keyword phrase over a conversational sentence. Never pass the user's literal utterance through when it contains unresolved pronouns, "that", "those", "it", "his", "her", "their", or similar references. This applies to every tool — webSearch, Wikipedia, MCP tools, all of them.""")
+
+
+# Repeat the constraints twice for better instruction-following in small models
+TOOL_CONSTRAINTS_SMALL = _TOOL_CONSTRAINTS_BASE + "\n\n" + _TOOL_CONSTRAINTS_BASE
+
+
+# =============================================================================
+# Prompt Assembly
+# =============================================================================
+
+def get_system_prompts(model_size: ModelSize) -> PromptComponents:
+    """
+    Get prompt components appropriate for the given model size.
+
+    Args:
+        model_size: The detected model size
+
+    Returns:
+        PromptComponents with all necessary prompt strings
+    """
+    if model_size == ModelSize.SMALL:
+        return PromptComponents(
+            asr_note=ASR_NOTE,
+            inference_guidance=INFERENCE_GUIDANCE,
+            tool_incentives=TOOL_INCENTIVES_SMALL,
+            voice_style=VOICE_STYLE,
+            tool_guidance=TOOL_GUIDANCE_SMALL,
+            tool_constraints=TOOL_CONSTRAINTS_SMALL,
+        )
+    else:
+        return PromptComponents(
+            asr_note=ASR_NOTE,
+            inference_guidance=INFERENCE_GUIDANCE,
+            tool_incentives=TOOL_INCENTIVES_LARGE,
+            voice_style=VOICE_STYLE,
+            tool_guidance=TOOL_GUIDANCE_LARGE,
+            tool_constraints=TOOL_CONSTRAINTS_LARGE,
+        )

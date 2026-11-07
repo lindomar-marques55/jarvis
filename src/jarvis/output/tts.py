@@ -1,0 +1,1201 @@
+from __future__ import annotations
+import platform
+import subprocess
+import threading
+import asyncio
+import queue
+import shutil
+import signal
+import tempfile
+import os
+import re
+import sys
+import time
+import warnings
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional, Callable
+from urllib.parse import urlparse
+
+from ..debug import debug_log
+from ..utils.audio_lock import portaudio_lock
+
+
+# ============================================================================
+# Piper TTS Model Configuration
+# ============================================================================
+# Default voice model for automatic download
+# en_GB-alan-medium: Good quality, ~60MB, British English male
+PIPER_DEFAULT_VOICE = "en_GB-alan-medium"
+_PIPER_DOWNLOAD_MAX_RETRIES = 4
+PIPER_VOICE_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0"
+
+
+def _get_piper_models_dir() -> Path:
+    """Get the directory for storing Piper voice models."""
+    base = Path.home() / ".local" / "share" / "jarvis" / "models" / "piper"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _get_default_piper_model_path() -> str:
+    """Get the path to the default Piper voice model."""
+    return str(_get_piper_models_dir() / f"{PIPER_DEFAULT_VOICE}.onnx")
+
+
+def _download_piper_file(url, target_path, desc, log, progress_callback):
+    """Publish a complete voice file after bounded transport/rate-limit retries."""
+    import requests
+
+    for attempt in range(_PIPER_DOWNLOAD_MAX_RETRIES + 1):
+        response = None
+        temp_path = None
+        retry_error = None
+        try:
+            response = requests.get(url, stream=True, timeout=60)
+            response.raise_for_status()
+            total_size = int(response.headers.get("content-length", 0))
+            downloaded = 0
+            started_at = time.monotonic()
+            last_update = started_at
+
+            def report_progress(complete=False):
+                elapsed = max(time.monotonic() - started_at, 0.001)
+                size = downloaded / 1_000_000
+                rate = size / elapsed
+                if total_size:
+                    pct = 100 if complete else min(99, int(downloaded * 100 / total_size))
+                    message = f"📥 Piper {desc}: {pct}%|| {size:.1f}/{total_size / 1_000_000:.1f} MB · {rate:.1f} MB/s"
+                else:
+                    if complete:
+                        message = f"📥 Piper {desc}: 100%|| {size:.1f} MB received · total size unknown"
+                    else:
+                        message = f"📥 Piper {desc}: {size:.1f} MB [total size unknown · {rate:.1f} MB/s]"
+                if progress_callback:
+                    progress_callback(message)
+
+            report_progress()
+            with tempfile.NamedTemporaryFile(mode="wb", dir=target_path.parent,
+                                    prefix=f".{target_path.name}.", suffix=".tmp",
+                                    delete=False) as file:
+                temp_path = Path(file.name)
+                for chunk in response.iter_content(chunk_size=8192):
+                    file.write(chunk)
+                    downloaded += len(chunk)
+                    if time.monotonic() - last_update >= 1:
+                        report_progress()
+                        last_update = time.monotonic()
+
+            temp_path.replace(target_path)
+            temp_path = None
+            report_progress(complete=True)
+            debug_log(f"Piper {desc} available: {target_path.name}", "tts")
+            return
+        except requests.exceptions.SSLError:
+            # Certificate and TLS configuration failures require user action.
+            raise
+        except requests.exceptions.HTTPError as exc:
+            if getattr(exc.response, "status_code", None) != 429:
+                raise
+            retry_error = exc
+        except (requests.ConnectionError, requests.Timeout,
+                requests.exceptions.ChunkedEncodingError) as exc:
+            retry_error = exc
+        finally:
+            try:
+                if response is not None:
+                    response.close()
+            finally:
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError as cleanup_error:
+                        log(f"  ⚠️ Cannot remove partial {target_path.name} download: {cleanup_error}")
+                        raise
+
+        if attempt == _PIPER_DOWNLOAD_MAX_RETRIES:
+            raise retry_error
+        wait = 2 ** (attempt + 1)
+        log(f"  ⏳ Piper {desc} download interrupted, retrying in {wait}s "
+            f"({attempt + 1}/{_PIPER_DOWNLOAD_MAX_RETRIES}): {retry_error}")
+        time.sleep(wait)
+
+
+def _download_piper_voice(voice_name: str, progress_callback: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """
+    Download a Piper voice model from HuggingFace.
+
+    Args:
+        voice_name: Voice name like "en_US-lessac-medium"
+        progress_callback: Optional callback for progress messages
+
+    Returns:
+        Path to the downloaded model, or None if download failed
+    """
+    import requests
+
+    def log(msg: str):
+        if progress_callback:
+            progress_callback(msg)
+        debug_log(msg, "tts")
+
+    # Parse voice name to construct URL
+    # Format: {lang}_{region}-{name}-{quality}
+    # Example: en_US-lessac-medium -> en/en_US/lessac/medium/en_US-lessac-medium.onnx
+    parts = voice_name.split("-")
+    if len(parts) < 3:
+        log(f"❌ Invalid voice name format: {voice_name}")
+        return None
+
+    lang_region = parts[0]  # e.g., "en_US"
+    name = parts[1]         # e.g., "lessac"
+    quality = parts[2]      # e.g., "medium"
+
+    lang = lang_region.split("_")[0]  # e.g., "en"
+
+    # Construct URLs
+    base_path = f"{lang}/{lang_region}/{name}/{quality}/{voice_name}"
+    onnx_url = f"{PIPER_VOICE_BASE_URL}/{base_path}.onnx"
+    json_url = f"{PIPER_VOICE_BASE_URL}/{base_path}.onnx.json"
+
+    # Target paths
+    models_dir = _get_piper_models_dir()
+    onnx_path = models_dir / f"{voice_name}.onnx"
+    json_path = models_dir / f"{voice_name}.onnx.json"
+
+    # Download with progress
+    try:
+        for url, target_path, desc in [
+            (onnx_url, onnx_path, "model"),
+            (json_url, json_path, "config"),
+        ]:
+            if target_path.exists():
+                log(f"  📦 {desc} already exists: {target_path.name}")
+                continue
+
+            _download_piper_file(url, target_path, desc, log, progress_callback)
+
+        return str(onnx_path)
+
+    except Exception as exc:
+        label = 'Download failed' if isinstance(exc, requests.RequestException) else 'Download error'
+        log(f"  ❌ {label}: {exc}")
+        return None
+
+
+# Default speaking rates for TTS estimation
+DEFAULT_WPM = 200  # Default rate used in config (words per minute)
+AUDIO_BUFFER_DELAY_SEC = 0.5  # Extra delay for audio buffer latency
+
+
+def _estimate_tts_duration(text: str, wpm: int) -> float:
+    """
+    Estimate how long TTS audio will take to play.
+
+    Args:
+        text: The text being spoken
+        wpm: Words per minute rate
+
+    Returns:
+        Estimated duration in seconds
+    """
+    # Count words (simple split on whitespace)
+    words = len(text.split())
+
+    # Calculate duration based on WPM
+    if wpm <= 0:
+        wpm = DEFAULT_WPM
+
+    duration_sec = (words / wpm) * 60.0
+
+    # Add buffer for audio latency
+    return duration_sec + AUDIO_BUFFER_DELAY_SEC
+
+
+def _extract_domain_description(url: str) -> tuple[str, bool]:
+    """
+    Extract a readable domain description from a URL.
+
+    Returns:
+        Tuple of (domain_description, is_homepage)
+        - domain_description: e.g., "google.com"
+        - is_homepage: True if URL points to homepage (no meaningful path)
+    """
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc or parsed.path.split('/')[0]
+
+        # Remove common prefixes
+        if domain.startswith('www.'):
+            domain = domain[4:]
+
+        # Check if it's a homepage (no path or just /)
+        path = parsed.path.rstrip('/')
+        is_homepage = not path or path == ''
+
+        return domain, is_homepage
+    except Exception:
+        return url, True
+
+
+_NUMBERED_MARKER_RE = re.compile(r"^\s*(\d+)[.)]\s+")
+
+
+def _strip_markdown_for_speech(text: str) -> str:
+    """Strip markdown formatting so TTS doesn't read syntax characters aloud.
+
+    Small models often produce markdown (``**bold**``, bullet lists, headings)
+    even when told to be conversational. Piper and similar engines read the
+    syntax characters literally ("asterisk asterisk bold asterisk asterisk").
+    This function removes the markup while preserving the words inside it.
+
+    Handled:
+    - Fenced code blocks ``` ```lang\\ncode\\n``` ``` → inner text only
+    - Inline code ``` `x` ``` → ``x``
+    - Bold ``**x**`` / ``__x__`` → ``x``
+    - Italic ``*x*`` / ``_x_`` → ``x``
+    - Strikethrough ``~~x~~`` → ``x``
+    - Word-internal underscores (e.g. ``my_function``) are preserved so
+      identifiers aren't mangled into concatenated words.
+    - HTML tags ``<b>x</b>`` → ``x``
+    - Leading heading markers ``# ``, ``## `` … at line start → removed
+    - Setext heading underlines (``===`` / ``---`` beneath a title line) → removed
+    - Leading blockquote markers ``> `` at line start → removed
+    - Leading bullet markers ``- ``, ``* ``, ``+ `` at line start → removed
+    - Leading numbered-list markers ``1. ``, ``2) ``: stripped only when the
+      line is part of a real list — detected as ≥2 adjacent lines whose
+      numbers are each ≤ 99. Prevents eating prose like "2024. The year...".
+    """
+    if not text:
+        return text
+
+    # Fenced code blocks: keep inner content, drop fences and language tag.
+    text = re.sub(r"```[a-zA-Z0-9_-]*\n?([\s\S]*?)```", r"\1", text)
+
+    # Inline code: keep inner content.
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+
+    # Bold / strikethrough (before italic so the double-char form matches first).
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"~~([^~]+)~~", r"\1", text)
+
+    # Italic with asterisk: single * not flanked by another *.
+    text = re.sub(r"(?<!\*)\*([^*\s][^*]*?)\*(?!\*)", r"\1", text)
+    # Italic with underscore: require word boundaries so we don't eat
+    # underscores inside identifiers like "some_variable_name".
+    text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"\1", text)
+
+    # HTML tags: drop tags, keep inner text. Safe here because TTS input is
+    # assistant prose, not code discussing literal inequalities like "x<3".
+    text = re.sub(r"<[^>]+>", "", text)
+
+    # True list detection: a numbered line is a list item only if it's part
+    # of a contiguous group of ≥2 such lines whose numbers are each ≤ 99.
+    # This preserves prose like "2024. The year..." and "2023.\n2024." pairs
+    # that are clearly years, not list markers.
+    lines = text.split("\n")
+    numbers = [
+        int(m.group(1)) if (m := _NUMBERED_MARKER_RE.match(line)) else None
+        for line in lines
+    ]
+    strip_numbered = [False] * len(lines)
+    run_start: Optional[int] = None
+    for i in range(len(lines) + 1):
+        in_run = i < len(lines) and numbers[i] is not None and numbers[i] <= 99
+        if in_run and run_start is None:
+            run_start = i
+        elif not in_run and run_start is not None:
+            if i - run_start >= 2:
+                for k in range(run_start, i):
+                    strip_numbered[k] = True
+            run_start = None
+
+    cleaned: list[str] = []
+    for i, line in enumerate(lines):
+        # Setext heading underline: a line of only = or - (≥3 chars) directly
+        # beneath a non-empty title line. Drop the underline; keep the title.
+        if (
+            i > 0
+            and lines[i - 1].strip()
+            and re.fullmatch(r"\s*(=+|-+)\s*", line)
+            and len(line.strip()) >= 3
+        ):
+            continue
+        stripped = re.sub(r"^\s*#{1,6}\s+", "", line)        # headings
+        stripped = re.sub(r"^\s*>\s?", "", stripped)         # blockquotes
+        stripped = re.sub(r"^\s*[-*+]\s+", "", stripped)     # bullets
+        if strip_numbered[i]:
+            stripped = _NUMBERED_MARKER_RE.sub("", stripped)
+        cleaned.append(stripped)
+    return "\n".join(cleaned)
+
+
+def _preprocess_for_speech(text: str) -> str:
+    """
+    Preprocess text for TTS by converting links to readable descriptions and
+    stripping markdown formatting.
+
+    Handles:
+    - Markdown links: [text](url) → "Link to domain.com with the text 'text'" or
+      "Link to a page under domain.com with the text 'text'"
+    - Raw URLs: https://domain.com → "domain.com homepage" or
+      https://domain.com/path → "a page under domain.com"
+    - Markdown formatting (bold, italic, code, headings, lists) → stripped so
+      TTS engines don't read syntax characters (``**``, ``#``, ``-``) aloud.
+    """
+    # Pattern for markdown links: [text](url)
+    markdown_link_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+
+    def replace_markdown_link(match: re.Match) -> str:
+        link_text = match.group(1)
+        url = match.group(2)
+        domain, is_homepage = _extract_domain_description(url)
+
+        if is_homepage:
+            return f"Link to {domain} homepage with the text '{link_text}'"
+        else:
+            return f"Link to a page under {domain} with the text '{link_text}'"
+
+    # Replace markdown links first
+    result = re.sub(markdown_link_pattern, replace_markdown_link, text)
+
+    # Pattern for raw URLs (not already processed as markdown)
+    # Matches http://, https://, and www. prefixed URLs
+    raw_url_pattern = r'(?<!\()(https?://[^\s<>\[\]()]+|www\.[^\s<>\[\]()]+)(?!\))'
+
+    def replace_raw_url(match: re.Match) -> str:
+        url = match.group(1)
+        # Ensure URL has protocol for parsing
+        if url.startswith('www.'):
+            url = 'https://' + url
+        domain, is_homepage = _extract_domain_description(url)
+
+        if is_homepage:
+            return f"{domain} homepage"
+        else:
+            return f"a page under {domain}"
+
+    # Replace raw URLs
+    result = re.sub(raw_url_pattern, replace_raw_url, result)
+
+    # Strip any remaining markdown so TTS doesn't read syntax aloud.
+    result = _strip_markdown_for_speech(result)
+
+    return result
+
+
+def _call_speech_callback(callback: Callable, arguments: tuple, label: str) -> None:
+    """Isolate observer failures, including cancellation of an observer's own task."""
+    try:
+        callback(*arguments)
+    except (Exception, asyncio.CancelledError) as exc:
+        debug_log(f'Speech {label} callback failed: {type(exc).__name__}', 'tts')
+
+
+_PlaybackStart = Callable[['SpeechRequest', float], None]
+_PlaybackEnd = Callable[['SpeechRequest', str], None]
+
+
+@dataclass(eq=False)
+class SpeechRequest:
+    """One cancellable utterance with success and terminal ownership callbacks."""
+
+    text: str
+    completion_callback: Optional[Callable[[], None]] = None
+    duration_callback: Optional[Callable[[float], None]] = None
+    terminal_callback: Optional[Callable[[str], None]] = None
+    _cancel_callback: Optional[Callable[['SpeechRequest'], None]] = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _active: bool = field(default=False, init=False)
+    _cancelled: bool = field(default=False, init=False)
+    _interrupted: bool = field(default=False, init=False)
+    _finished: bool = field(default=False, init=False)
+    _playback_started: bool = field(default=False, init=False)
+    _playback_started_at: float = field(default=0.0, init=False)
+    _playback_callbacks: tuple[Optional[_PlaybackStart], Optional[_PlaybackEnd]] = field(default=(None, None), init=False, repr=False)
+    _activity_release: Optional[Callable[[], None]] = field(default=None, init=False, repr=False)
+
+    def _claim(self) -> bool:
+        with self._lock:
+            if self._finished or self._cancelled:
+                return False
+            self._active = True
+            return True
+
+    @property
+    def abandoned(self) -> bool:
+        with self._lock:
+            return self._cancelled or self._interrupted
+
+    def _interrupt(self) -> None:
+        with self._lock:
+            self._interrupted = True
+
+    def cancel(self) -> None:
+        self._abandon('cancelled')
+
+    def interrupt(self) -> None:
+        """Interrupt this utterance without affecting a queued replacement."""
+        self._abandon('interrupted')
+
+    def _abandon(self, outcome: str) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            if outcome == 'cancelled':
+                self._cancelled = True
+            else:
+                self._interrupted = True
+            active, interrupt = self._active, self._cancel_callback
+        try:
+            if active and interrupt is not None:
+                interrupt(self)
+        finally:
+            if not active:
+                self._finish(outcome)
+
+    def _finish(self, outcome: str) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            if self._cancelled:
+                outcome = 'cancelled'
+            elif self._interrupted:
+                outcome = 'interrupted'
+            callbacks = []
+            if self._playback_started and self._playback_callbacks[1] is not None:
+                callbacks.append((self._playback_callbacks[1], (self, outcome), 'playback finish'))
+            if outcome == 'completed' and self.completion_callback is not None:
+                callbacks.append((self.completion_callback, (), 'completion'))
+            if self._activity_release is not None:
+                callbacks.append((self._activity_release, (), 'activity release'))
+            if self.terminal_callback is not None:
+                callbacks.append((self.terminal_callback, (outcome,), 'terminal'))
+            self.completion_callback = self.duration_callback = self.terminal_callback = None
+            self._cancel_callback = self._activity_release = None
+            self._playback_callbacks = (None, None)
+        for callback, arguments, label in callbacks:
+            _call_speech_callback(callback, arguments, label)
+
+
+class _QueuedSpeech:
+    """Own worker admission and request release independently of synthesis."""
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[Optional[SpeechRequest]] = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.RLock()
+        self._lifecycle_generation = 0
+        self._stop = threading.Event()
+        self._is_speaking = threading.Event()
+        self._last_spoken_text = ''
+        self._should_interrupt = threading.Event()
+        self._active_request: Optional[SpeechRequest] = None
+        self._preparation_started_at = 0.0
+        self._playback_callbacks: tuple[Optional[_PlaybackStart], Optional[_PlaybackEnd]] = (None, None)
+
+    def preparing_request_at(self, capture_time: float) -> Optional[SpeechRequest]:
+        """Identify still-active speech whose synthesis overlaps this capture."""
+        with self._lifecycle_lock:
+            request = self._active_request
+            if (request is not None and not request.abandoned
+                    and 0 < self._preparation_started_at <= capture_time <= time.time()
+                    and (not request._playback_started
+                         or capture_time < request._playback_started_at)):
+                return request
+            return None
+
+    def set_playback_callbacks(self, started: Optional[_PlaybackStart],
+                               finished: Optional[_PlaybackEnd]) -> None:
+        """Observe future playback, retaining the matching termination callback."""
+        with self._lifecycle_lock:
+            self._playback_callbacks = started, finished
+
+    def _begin_playback(self, request: SpeechRequest, duration: float) -> bool:
+        with self._lifecycle_lock:
+            if self._stop.is_set() or request.abandoned:
+                return False
+            request._playback_callbacks = self._playback_callbacks
+            request._playback_started = True
+            request._playback_started_at = time.time()
+            self._last_spoken_text = request.text
+            self._is_speaking.set()
+            try:
+                from jarvis.activity import JarvisState, get_jarvis_state
+                manager = get_jarvis_state()
+                owner = manager.acquire_state(
+                    JarvisState.SPEAKING, restore_state=JarvisState.IDLE,
+                    protected_states={JarvisState.DICTATING, JarvisState.DICTATION_PROCESSING},
+                )
+                debug_log(f'Playback activity ownership: {owner is not None}', 'tts')
+                if owner is not None:
+                    request._activity_release = lambda: manager.release_state(owner)
+            except Exception as exc:
+                debug_log(f'Speech activity unavailable: {type(exc).__name__}', 'tts')
+        callback = request._playback_callbacks[0]
+        if callback is not None:
+            _call_speech_callback(callback, (request, duration), 'playback start')
+        return not self._stop.is_set() and not request.abandoned
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            generation = self._lifecycle_generation
+        self._start_if_current(generation)
+
+    def _start_if_current(self, generation: int) -> None:
+        with self._lifecycle_lock:
+            if (generation != self._lifecycle_generation or not self.enabled
+                    or (self._thread is not None and self._thread.is_alive())):
+                return
+        available, error = self._prepare_speech()
+        with self._lifecycle_lock:
+            if (generation != self._lifecycle_generation or not self.enabled
+                    or (self._thread is not None and self._thread.is_alive())):
+                return
+            if not available:
+                self.enabled = False
+                message = f'{type(self).__name__} speech output unavailable: {error}'
+                print(f'  ⚠️ {message}', flush=True)
+                debug_log(message, 'tts')
+                return
+            discarded = self._drain_pending_speech()
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        for request in discarded:
+            request._finish('cancelled')
+
+    def _drain_pending_speech(self) -> list[SpeechRequest]:
+        requests = []
+        while True:
+            try:
+                request = self._q.get_nowait()
+            except queue.Empty:
+                return requests
+            if request is not None:
+                requests.append(request)
+
+    def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._lifecycle_generation += 1
+            self._stop.set()
+            self.interrupt()
+            discarded = self._drain_pending_speech()
+            worker = self._thread
+            if worker is not None:
+                self._q.put_nowait(None)
+        for request in discarded:
+            request._finish('cancelled')
+        if worker is None:
+            return
+        if worker is not threading.current_thread():
+            worker.join(timeout=2.0)
+        with self._lifecycle_lock:
+            if self._thread is worker and not worker.is_alive():
+                self._thread = None
+            elif worker.is_alive():
+                debug_log('Speech worker is draining after stop', 'tts')
+
+    def speak(self, text: str, completion_callback: Optional[Callable[[], None]] = None,
+              duration_callback: Optional[Callable[[float], None]] = None, *,
+              terminal_callback: Optional[Callable[[str], None]] = None) -> SpeechRequest:
+        request = SpeechRequest(text, completion_callback, duration_callback,
+                                terminal_callback, self._cancel_request)
+        admitted = False
+        outcome = 'rejected'
+        try:
+            if not self.enabled or not text.strip():
+                return request
+            with self._lifecycle_lock:
+                generation = self._lifecycle_generation
+            outcome = 'failed'
+            self._start_if_current(generation)
+            with self._lifecycle_lock:
+                if generation != self._lifecycle_generation or self._stop.is_set():
+                    outcome = 'cancelled'
+                    return request
+                if not self.enabled:
+                    outcome = 'rejected'
+                    return request
+                request.text = _preprocess_for_speech(text)
+                self._q.put_nowait(request)
+                admitted = True
+            return request
+        finally:
+            if not admitted:
+                request._finish(outcome)
+
+    def _interrupt_active_request(self) -> None:
+        with self._lifecycle_lock:
+            if self._active_request is not None:
+                self._active_request._interrupt()
+            self._should_interrupt.set()
+
+    def _cancel_request(self, request: SpeechRequest) -> None:
+        with self._lifecycle_lock:
+            if self._active_request is request:
+                self.interrupt()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                request = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if request is None:
+                continue
+            outcome = 'cancelled'
+            try:
+                with self._lifecycle_lock:
+                    active = not self._stop.is_set() and request._claim()
+                    if active:
+                        self._active_request = request
+                        self._preparation_started_at = time.time()
+                if active:
+                    outcome = 'completed' if self._speak_once(request) is True else 'failed'
+                    if self._stop.is_set():
+                        outcome = 'cancelled'
+                    elif self._should_interrupt.is_set():
+                        outcome = 'interrupted'
+            except Exception as exc:
+                outcome = 'failed'
+                debug_log(f'Speech worker failed: {exc}', 'tts')
+            finally:
+                try:
+                    request._finish(outcome)
+                finally:
+                    # Replacement waits for this worker; retain its request
+                    # identity until terminal commitment and callback release.
+                    self._active_request = None
+                    self._preparation_started_at = 0.0
+                    del request
+
+
+class ChatterboxTTS(_QueuedSpeech):
+    """Experimental TTS implementation using Resemble AI's Chatterbox model."""
+
+    def __init__(self, enabled: bool = True, voice: Optional[str] = None, rate: Optional[int] = None,
+                 device: str = "cuda", audio_prompt_path: Optional[str] = None,
+                 exaggeration: float = 0.5, cfg_weight: float = 0.5) -> None:
+        self.enabled = enabled
+        self.voice = voice  # Not used in Chatterbox, kept for interface compatibility
+        self.rate = rate    # Not directly supported in Chatterbox, kept for interface compatibility
+        self.device = device
+        self.audio_prompt_path = audio_prompt_path
+        self.exaggeration = exaggeration
+        self.cfg_weight = cfg_weight
+
+        super().__init__()
+
+        # Chatterbox model (eagerly loaded during initialization)
+        self._model = None
+        self._model_error = None
+        # Lazy initialization flags
+        self._initialized = False
+        self._init_lock = threading.Lock()
+
+    def _initialize_with_logging(self) -> None:
+        """Initialize Chatterbox with proper logging."""
+        import sys
+
+        print("🔧 [TTS] Initializing Chatterbox neural voice synthesis...", file=sys.stderr)
+
+        try:
+            print("📦 [TTS] Loading Chatterbox dependencies...", file=sys.stderr)
+
+            # Import dependencies
+            import torch
+            import torchaudio as ta
+            from chatterbox.tts import ChatterboxTTS as ChatterboxModel
+
+            # Check device availability
+            if self.device == "cuda" and not torch.cuda.is_available():
+                print("⚠️  [TTS] CUDA requested but not available, falling back to CPU", file=sys.stderr)
+                actual_device = "cpu"
+            else:
+                actual_device = self.device
+
+            print(f"🚀 [TTS] Loading Chatterbox model on {actual_device.upper()}...", file=sys.stderr)
+
+            # Load model with proper device specification
+            self._model = ChatterboxModel.from_pretrained(device=actual_device)
+
+            print("✅ [TTS] Chatterbox neural voice synthesis ready!", file=sys.stderr)
+
+        except ImportError as e:
+            self._model_error = f"Chatterbox dependencies not available: {e}"
+            print(f"❌ [TTS] Missing dependencies: {self._model_error}", file=sys.stderr)
+            warnings.warn(f"ChatterboxTTS initialization failed: {self._model_error}")
+        except Exception as e:
+            self._model_error = f"Failed to load Chatterbox model: {e}"
+            print(f"❌ [TTS] Model loading failed: {self._model_error}", file=sys.stderr)
+            warnings.warn(f"ChatterboxTTS initialization failed: {self._model_error}")
+
+    def _ensure_initialized(self) -> None:
+        """Initialize heavy dependencies only once, when actually needed."""
+        if self._initialized or not self.enabled:
+            return
+        with self._init_lock:
+            if self._initialized:
+                return
+            self._initialize_with_logging()
+            self._initialized = True
+
+    def _ensure_model(self) -> bool:
+        """Check if Chatterbox model is loaded. Returns True if successful."""
+        # Ensure lazy initialization happens before checking model
+        self._ensure_initialized()
+        if self._model is not None:
+            return True
+        if self._model_error is not None:
+            return False
+        return False
+
+    def _prepare_speech(self) -> tuple[bool, Optional[str]]:
+        return self._ensure_model(), self._model_error
+
+    def interrupt(self) -> None:
+        """Stop current speech immediately."""
+        self._interrupt_active_request()
+
+    def _speak_once(self, request: SpeechRequest) -> bool:
+        text = request.text
+        with self._lifecycle_lock:
+            if self._stop.is_set() or request.abandoned:
+                return False
+            self._should_interrupt.clear()
+        
+
+        try:
+            # Check if model is available
+            if not self._ensure_model():
+                # Fall back to system TTS if Chatterbox fails
+                warnings.warn("Chatterbox TTS not available, skipping speech synthesis")
+                return False
+
+            # Generate audio using Chatterbox
+            import tempfile
+            import pygame
+            import os
+
+            # Generate speech
+            wav = self._model.generate(
+                text,
+                audio_prompt_path=self.audio_prompt_path,
+                exaggeration=self.exaggeration,
+                cfg_weight=self.cfg_weight
+            )
+
+            if self._stop.is_set() or self._should_interrupt.is_set():
+                return False
+
+            # Calculate exact duration from audio samples
+            exact_duration = wav.shape[-1] / self._model.sr
+            debug_log(f"Chatterbox TTS synthesis complete: {exact_duration:.2f}s", "tts")
+
+            # Notify listener of exact duration for precise echo detection
+            if request.duration_callback is not None:
+                _call_speech_callback(request.duration_callback, (exact_duration,), 'duration')
+
+            # Save to temporary file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+
+            try:
+                # Save audio
+                import torchaudio as ta
+                ta.save(tmp_path, wav, self._model.sr)
+
+                # Play audio using pygame (cross-platform)
+                pygame.mixer.init(frequency=self._model.sr, size=-16, channels=1, buffer=1024)
+                pygame.mixer.music.load(tmp_path)
+                if not self._begin_playback(request, exact_duration):
+                    return False
+                with self._lifecycle_lock:
+                    if self._stop.is_set() or self._should_interrupt.is_set():
+                        return False
+                    pygame.mixer.music.play()
+
+                # Wait for playback to complete or interruption
+                while pygame.mixer.music.get_busy():
+                    if self._should_interrupt.is_set():
+                        pygame.mixer.music.stop()
+                        break
+                    pygame.time.wait(100)  # Check every 100ms
+
+            finally:
+                # Cleanup
+                pygame.mixer.quit()
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+            return True
+
+        except Exception as e:
+            warnings.warn(f"Chatterbox TTS error: {e}")
+        finally:
+            self._is_speaking.clear()
+            
+        return False
+    
+
+    # Loopback guard helpers (same interface as TextToSpeech)
+    def is_speaking(self) -> bool:
+        return self._is_speaking.is_set()
+
+    def get_last_spoken_text(self) -> str:
+        return self._last_spoken_text
+
+
+class PiperTTS(_QueuedSpeech):
+    """TTS implementation using Piper (local neural TTS with exact duration).
+
+    Piper generates actual audio samples, enabling precise duration calculation
+    instead of WPM-based estimation. Uses sounddevice for streaming playback
+    with responsive interruption support.
+    """
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        voice: Optional[str] = None,
+        rate: Optional[int] = None,
+        model_path: Optional[str] = None,
+        speaker: Optional[int] = None,
+        length_scale: float = 1.0,
+        noise_scale: float = 0.667,
+        noise_w: float = 0.8,
+        sentence_silence: float = 0.2,
+    ) -> None:
+        self.enabled = enabled
+        self.voice = voice  # Not used in Piper, kept for interface compatibility
+        self.rate = rate    # Not directly supported, use length_scale instead
+        self.model_path = model_path
+        self.speaker = speaker
+        self.length_scale = length_scale
+        self.noise_scale = noise_scale
+        self.noise_w = noise_w
+        self.sentence_silence = sentence_silence
+
+        super().__init__()
+
+        # Piper voice (lazy loaded)
+        self._voice = None
+        self._sample_rate: int = 22050  # Piper default, updated on model load
+        self._initialized = False
+        self._init_lock = threading.Lock()
+        self._init_error: Optional[str] = None
+
+        # Audio stream for interruption
+        self._audio_stream = None
+        self._audio_lock = threading.Lock()
+
+    def _ensure_initialized(self) -> bool:
+        """Initialize Piper voice model. Returns True if successful.
+
+        If no model is configured, automatically downloads the default voice.
+        """
+        if self._initialized:
+            return self._voice is not None
+        if not self.enabled:
+            return False
+
+        with self._init_lock:
+            if self._initialized:
+                return self._voice is not None
+
+            try:
+                # Use configured path or default
+                model_path = self.model_path
+                if not model_path:
+                    model_path = _get_default_piper_model_path()
+                    debug_log(f"No model configured, using default: {model_path}", "tts")
+
+                # Expand user path (e.g., ~/models/voice.onnx)
+                model_path = os.path.expanduser(model_path)
+                config_path = model_path + ".json"
+
+                # Auto-download if model doesn't exist
+                if not os.path.exists(model_path) or not os.path.exists(config_path):
+                    # Extract voice name from path for download
+                    voice_name = os.path.basename(model_path).replace(".onnx", "")
+
+                    print(f"🔊 Downloading Piper voice: {voice_name}", file=sys.stderr, flush=True)
+                    print("   This is a one-time download (~60MB)...", file=sys.stderr, flush=True)
+
+                    def progress(msg):
+                        print(msg, file=sys.stderr, flush=True)
+
+                    downloaded_path = _download_piper_voice(voice_name, progress_callback=progress)
+
+                    if not downloaded_path:
+                        self._init_error = f"Failed to download voice: {voice_name}"
+                        debug_log(f"Piper TTS init failed: {self._init_error}", "tts")
+                        self._initialized = True
+                        return False
+
+                    model_path = downloaded_path
+                    config_path = model_path + ".json"
+                    print("✓ Voice downloaded successfully!", file=sys.stderr, flush=True)
+
+                # Final check that files exist
+                if not os.path.exists(model_path):
+                    self._init_error = f"Model file not found: {model_path}"
+                    debug_log(f"Piper TTS init failed: {self._init_error}", "tts")
+                    self._initialized = True
+                    return False
+
+                if not os.path.exists(config_path):
+                    self._init_error = f"Model config not found: {config_path}"
+                    debug_log(f"Piper TTS init failed: {self._init_error}", "tts")
+                    self._initialized = True
+                    return False
+
+                debug_log(f"Piper TTS loading model: {model_path}", "tts")
+
+                # Import piper and load model
+                from piper.voice import PiperVoice
+
+                self._voice = PiperVoice.load(model_path, config_path)
+                self._sample_rate = self._voice.config.sample_rate
+
+                debug_log(f"Piper TTS initialized: sample_rate={self._sample_rate}", "tts")
+
+            except ImportError as e:
+                self._init_error = f"piper-tts not installed: {e}"
+                debug_log(f"Piper TTS init failed: {self._init_error}", "tts")
+            except Exception as e:
+                self._init_error = f"Failed to load Piper model: {e}"
+                debug_log(f"Piper TTS init failed: {self._init_error}", "tts")
+
+            self._initialized = True
+            return self._voice is not None
+
+
+    def _prepare_speech(self) -> tuple[bool, Optional[str]]:
+        return self._ensure_initialized(), self._init_error
+
+    def interrupt(self) -> None:
+        """Stop current speech immediately."""
+        self._interrupt_active_request()
+        with self._audio_lock:
+            if self._audio_stream is not None:
+                try:
+                    with portaudio_lock:
+                        self._audio_stream.abort()
+                except Exception:
+                    pass
+
+
+    def _speak_once(self, request: SpeechRequest) -> bool:
+        text = request.text
+        with self._lifecycle_lock:
+            if self._stop.is_set() or request.abandoned:
+                return False
+            self._should_interrupt.clear()
+
+
+        try:
+            # Initialize on first use
+            if not self._ensure_initialized():
+                if self._init_error:
+                    print(f"  ⚠️ Piper TTS: {self._init_error}", flush=True)
+                return False
+
+            import sounddevice as sd
+            import numpy as np
+
+            start_time = time.time()
+
+            debug_log(f"Piper TTS starting synthesis: {len(text.split())} words", "tts")
+
+            # Check for interruption before synthesis
+            if self._should_interrupt.is_set():
+                debug_log("Piper TTS interrupted before synthesis", "tts")
+                return False
+
+            # Synthesize audio - synthesize() returns an iterable of AudioChunks
+            from piper.config import SynthesisConfig
+            syn_config = SynthesisConfig(
+                speaker_id=self.speaker,
+                length_scale=self.length_scale,
+                noise_scale=self.noise_scale,
+                noise_w_scale=self.noise_w,
+            )
+            audio_chunks = []
+            for chunk in self._voice.synthesize(text, syn_config):
+                if self._should_interrupt.is_set():
+                    debug_log("Piper TTS interrupted during synthesis", "tts")
+                    return False
+                audio_chunks.append(chunk.audio_int16_array)
+
+            # Check for interruption after synthesis
+            if self._should_interrupt.is_set():
+                debug_log("Piper TTS interrupted after synthesis", "tts")
+                return False
+
+            # Concatenate all audio chunks
+            if not audio_chunks:
+                debug_log("Piper TTS: no audio chunks generated", "tts")
+                return False
+
+            full_audio = np.concatenate(audio_chunks)
+
+            if len(full_audio) == 0:
+                debug_log("Piper TTS: no audio generated", "tts")
+                return False
+
+            # Calculate exact duration from actual samples
+            exact_duration = len(full_audio) / self._sample_rate
+            debug_log(f"Piper TTS synthesis complete: {exact_duration:.2f}s, {len(full_audio)} samples", "tts")
+
+            # Notify listener of exact duration for precise echo detection
+            if request.duration_callback is not None:
+                _call_speech_callback(request.duration_callback, (exact_duration,), 'duration')
+
+            # Play audio with streaming for interruption support
+            play_position = [0]
+            blocksize = 1024  # Small blocks for responsive interruption
+
+            drained = threading.Event()
+            callback_failed = threading.Event()
+
+            def audio_callback(outdata, frames, time_info, status):
+                try:
+                    if self._should_interrupt.is_set():
+                        raise sd.CallbackAbort()
+
+                    start = play_position[0]
+                    end = start + frames
+                    chunk = full_audio[start:end]
+
+                    if len(chunk) < frames:
+                        outdata[:len(chunk), 0] = chunk
+                        outdata[len(chunk):, 0] = 0
+                        drained.set()
+                        raise sd.CallbackStop()
+                    outdata[:, 0] = chunk
+                    play_position[0] = end
+                except (sd.CallbackAbort, sd.CallbackStop):
+                    raise
+                except Exception:
+                    callback_failed.set()
+                    raise sd.CallbackAbort() from None
+
+            stream = None
+            try:
+                if self._stop.is_set() or request.abandoned:
+                    return False
+                with portaudio_lock:
+                    stream = sd.OutputStream(
+                        samplerate=self._sample_rate,
+                        channels=1,
+                        dtype='int16',
+                        blocksize=blocksize,
+                        callback=audio_callback,
+                    )
+                if not self._begin_playback(request, exact_duration):
+                    return False
+                with self._lifecycle_lock, self._audio_lock:
+                    if self._stop.is_set() or request.abandoned:
+                        return False
+                    self._audio_stream = stream
+                    with portaudio_lock:
+                        stream.start()
+
+                while stream.active:
+                    if self._should_interrupt.is_set():
+                        with portaudio_lock:
+                            stream.abort()
+                        break
+                    time.sleep(0.05)
+            finally:
+                with self._audio_lock:
+                    if self._audio_stream is stream:
+                        self._audio_stream = None
+                if stream is not None:
+                    try:
+                        with portaudio_lock:
+                            stream.close()
+                    except Exception as exc:
+                        debug_log(f'Piper stream cleanup failed: {type(exc).__name__}', 'tts')
+
+            actual_duration = time.time() - start_time
+            successful = drained.is_set() and not callback_failed.is_set()
+            debug_log(f"Piper playback ended: successful={successful}, actual={actual_duration:.2f}s (audio={exact_duration:.2f}s)", "tts")
+            return successful
+
+        except Exception as e:
+            debug_log(f"Piper TTS error: {e}", "tts")
+            print(f"  ⚠️ Piper TTS error: {e}", flush=True)
+        finally:
+            self._is_speaking.clear()
+        return False
+
+
+    # Loopback guard helpers (same interface as TextToSpeech)
+    def is_speaking(self) -> bool:
+        return self._is_speaking.is_set()
+
+    def get_last_spoken_text(self) -> str:
+        return self._last_spoken_text
+
+
+def create_tts_engine(
+    engine: str = "piper",
+    enabled: bool = True,
+    voice: Optional[str] = None,
+    rate: Optional[int] = None,
+    # Chatterbox parameters
+    device: str = "cuda",
+    audio_prompt_path: Optional[str] = None,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+    # Piper parameters
+    piper_model_path: Optional[str] = None,
+    piper_speaker: Optional[int] = None,
+    piper_length_scale: float = 1.0,
+    piper_noise_scale: float = 0.667,
+    piper_noise_w: float = 0.8,
+    piper_sentence_silence: float = 0.2,
+):
+    """Factory function to create the appropriate TTS engine.
+
+    Supported engines:
+    - "piper" (default): Neural TTS with auto-download, exact duration tracking
+    - "chatterbox": AI voice with emotion control (requires PyTorch)
+    """
+    if engine.lower() == "chatterbox":
+        return ChatterboxTTS(
+            enabled=enabled,
+            voice=voice,
+            rate=rate,
+            device=device,
+            audio_prompt_path=audio_prompt_path,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+        )
+    else:
+        # Default to Piper TTS
+        return PiperTTS(
+            enabled=enabled,
+            voice=voice,
+            rate=rate,
+            model_path=piper_model_path,
+            speaker=piper_speaker,
+            length_scale=piper_length_scale,
+            noise_scale=piper_noise_scale,
+            noise_w=piper_noise_w,
+            sentence_silence=piper_sentence_silence,
+        )
+
+
+def json_escape_ps(s: str) -> str:
+    # For PowerShell, use double quotes and escape internal double quotes
+    # This avoids issues with apostrophes in contractions like "you're"
+    escaped = s.replace('"', '""')
+    return '"' + escaped + '"'

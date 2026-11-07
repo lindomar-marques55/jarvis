@@ -1,0 +1,351 @@
+# 🧪 Jarvis Evaluation Report
+
+**Generated:** 2026-05-04 (gemma4:e2b column refreshed with retry-aware outcomes from a full `--single` run; gpt-oss:20b column inherited unchanged from the 2026-04-27 regen)
+
+## 🧰 Local evaluation endpoints
+
+The model under test and judge share `EVAL_JUDGE_MODEL` and `EVAL_JUDGE_BASE_URL`.
+Set `EVAL_JUDGE_PROVIDER=ollama` for a native Ollama endpoint on a custom port,
+or `openai_compatible` for a local OpenAI-compatible server. OpenAI-compatible
+URLs accept either the server root or a `/v1` suffix.
+
+```bash
+EVAL_JUDGE_PROVIDER=ollama EVAL_JUDGE_BASE_URL=http://127.0.0.1:11439 \
+EVAL_JUDGE_MODEL=gemma4:e2b python -m pytest evals/test_graph_branch_routing.py -q
+```
+
+An explicit provider selects that transport for both availability checks and
+judge calls. Without an override, judge calls detect the endpoint; the model
+fixture defaults to Ollama on port 11434 and OpenAI-compatible on other ports.
+Voice intent and listener suites use the selected model and transport, including
+model names exposed by an OpenAI-compatible server. Missing models are skipped;
+available models run their behavioural cases. Tool routing uses the selected
+chat transport; embedding filtering checks its configured embedding model
+independently of the chat model name. Filtering, context-aware and implicit-intent
+routing evaluations reject empty or irrelevant router answers even if keyword
+fallback selects the expected tool.
+
+Use an explicit provider for custom ports. The results below belong to the dated
+report above; a targeted local run does not refresh the full report.
+
+## 📊 TL;DR
+
+**Overall:** 🟢 **340/354 passed (96.0%)** across all categories *(small-model column re-baselined from a fresh `gemma4:e2b` run with up to 3× retries; three new tests added in #352, one intent-judge regression introduced by `a8f133c` recovered by the prompt fix in this PR — see "Intent judge" below)*
+
+| Category | Model | Passed | Failed | Skipped | Pass Rate |
+|----------|-------|-------:|-------:|--------:|----------:|
+| 🤖 Agent behaviour | `gemma4:e2b` | 136 | 7 | 2 | 🟢 95.1% |
+| 🤖 Agent behaviour | `gpt-oss:20b` | 145 | 7 | 0 | 🟢 95.4% |
+| 🎤 Intent judge | `gemma4:e2b` (fixed) | 48 | 0 | 0 | 🟢 100.0% |
+| 🧠 Memory merge consolidation | `gemma4:e2b` | 11 | 0 | 0 | 🟢 100.0% |
+
+### 💡 Model Selection Guide
+
+| Model | Best For | Trade-offs |
+|-------|----------|------------|
+| `gemma4:e2b` | Quick responses, lower RAM usage | May struggle with complex reasoning |
+| `gpt-oss:20b` | Best accuracy, complex tasks | Slower, requires more RAM |
+
+---
+
+## 🤖 Agent behaviour
+
+> Runs the full agent pipeline against each judge model. Tests are compared side-by-side.
+
+| Test Case | gemma4:e2b | gpt-oss:20b |
+|-----------|----------:|----------:|
+| 3-turn conversation with topic changes | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Active hot window follow up accepted | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Adversarial: all three branches in one summary | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Adversarial: food preference (USER) vs list-length rule (DIRECTIVES) | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Agent calls webSearch for info queries | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Agent chains search → fetch for details | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Agent uses memory + nutrition data | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Assistant checks memory before asking about interests | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Assistant does not deny having long-term memory | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Bad: deflection without attempting answer | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Bad: empty acknowledgment | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Bad: generic greeting ignores query | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Casual statement without wake word rejected | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Chained research: who directed Possessor and what else have they made | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Correction loop accepts single or retry | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Cross turn pronoun resolution | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| DIRECTIVES: tone, length, forbidden phrases, address form | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Date query with date in context returns none | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Diary location grounds getWeather call (#352) | ❌ 0/1 (0%) | ➖ |
+| Diet changed from bulking to cutting | ⏭️ SKIPPED | 🔸 1/1 XFAIL |
+| Digested tool result produces grounded reply | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Director-then-filmography needs two searches | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Enrichment results appear in system message | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Enrichment skips questions answered by context | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Escape hatch then follow up action | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Evaluator emits structured tool call for obvious search | ✅ 1/1 (100%) | 🔸 1/1 XFAIL |
+| Extraction with explicit quantities | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| First turn calls web search not clarification | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Follow up after correction calls web search | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Follow up resolves pronoun in search query | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Follow-up references previous turn context | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Followup naming place routes to getWeather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Followup supplies missing tool arg — short follow-up continues previous tool chain (#352) | ✅ 1/1 (100%) | ➖ |
+| Good: brief but informative | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Good: complete weekly forecast | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Graph supplies missing tool arg — warm-profile fact grounds getWeather call (#352) | ❌ 0/1 (0%) | ➖ |
+| Graph-enriched facts surface in the reply, no denial | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Greeting: hello | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Greeting: ni hao (Chinese) | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Handles ambiguous portion descriptions | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Honest block when all providers fail | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Hot window query is directed and non empty | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Identity query does not trigger recommendation engagement rule | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Identity query surfaces multiple user facts when present | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Identity query surfaces user stated fact over past qa | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Identity query with only past qa returns none or no false facts | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Instruction: be more brief | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Instruction: use Celsius | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Judge echo claim overridden in hot window | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| LLM uses enrichment-surfaced interests for personalised search | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Links only payload produces honest cant read reply | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Location context flows to search queries | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Location query with location in context returns none | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Location query with partial hint still routes sensibly | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| LogMealTool stores meals with macros | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Max-turn cap delivers a digest reply, never silence | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Memory enrichment: personalized news | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Memory enrichment: time-based recall | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Memory enrichment: topic recall | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Mixed summary: keep novel facts, drop stale weather/recommendations | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Navigate prose gets nudged into tool call | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| No deflection: tech news | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| No deflection: time query | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| No deflection: tomorrow weather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| No deflection: weekly rain forecast | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| No email tool declines honestly | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| No hint at all still routes sensibly | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| No wake word rejected despite judge | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Novel knowledge: local business details and user location | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Novel knowledge: non-English summary (Turkish) | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Novel knowledge: relocation plans and employment | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Novel knowledge: user diet plan and preferred recipe | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Nudge cap stops loop | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Nutrition: cheeseburger with fries | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Nutrition: chicken with broccoli | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Nutrition: oatmeal with banana | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Office days changed from Mon/Wed to Mon/Thu | ⏭️ SKIPPED | 🔸 1/1 XFAIL |
+| Omits deflection narration for unknown entity | ✅ 1/1 (100%) | 🔸 1/1 XFAIL |
+| Omits deflection when topic never resolved | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Open-ended prompt grounds in stored knowledge | ❌ 0/1 (0%) | ✅ 1/1 (100%) |
+| Parallel weather lookup: compare Paris and London | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Preserves legitimate user preferences | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Realistic web search payload is not deflected to links | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Recommendation query still surfaces engagement when user facts present | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Reframing: life events framed as facts with temporal context | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Reframing: requests become knowledge, not interaction descriptions | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Reject: assistant self-references (recommendations are not knowledge) | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Reject: stale temporal snapshots (weather, time of day) | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Restaurant recommendation surfaces past cuisine interest | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Returns NONE for non-food inputs | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Returns valid JSON with all required fields | ❌ 0/1 (0%) | ✅ 1/1 (100%) |
+| Simple meal baseline (2 boiled eggs) | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Single weather query ends after one tool call | ✅ 1/1 (100%) | ❌ 0/1 (0%) |
+| Speech long after tts requires wake word | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Stop during tts interrupts immediately | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Time query with time in context returns none | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Tool calls literal not surfaced after web search | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Tool retry: explicit tool mention | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Tool retry: vague go ahead | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Tool retry: vague just try | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Toolsearchtool widens then navigate | 🔸 1/1 XFAIL | 🔸 1/1 XFAIL |
+| Topic switch: search → weather uses getWeather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Topic switch: weather → store hours uses webSearch | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Trivial conversations produce no extracted facts | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Tts echo segments skipped user query extracted | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Turn1 possessor then turn2 weather | ❌ 0/1 (0%) | ✅ 1/1 (100%) |
+| Two-turn celebrity flow: identity then pronoun follow-up | 🔸 1/1 XFAIL | ❌ 0/1 (0%) |
+| USER: identity, location, pets, diet, job | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Unknown entity with poisoned diary still triggers web search live | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Unknown entity: Piranesi (book) | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Unknown entity: Possessor (film) | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Unknown entity: have-you-heard-of (Piranesi) | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Unknown entity: permission-framed (Possessor) | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| Unrelated domain still returns none | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Unrelated topics are not welded into one clause | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| User query not confused with echo after tts | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Utterance started during tts treated as hot window | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| WORLD: local business details, film attribution | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Wake word query after echo segments | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Wake word query uses judge extraction | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Watch recommendation surfaces recently discussed films | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Weather query is answered with current conditions | ❌ 0/1 (0%) | ✅ 1/1 (100%) |
+| Weather query still picks getWeather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Weather query still triggers tools after a greeting | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Wikipedia payload produces grounded reply | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| Wikipedia rescues when ddg blocks | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| calorie budget \u2192 fetchMeals | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| cold-memory-short-query-how's the weather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| cold-memory-week-forecast-what's the weather this week | ✅ 1/1 (100%) | ❌ 0/1 (0%) |
+| dietary check \u2192 fetchMeals | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| explicit-recall-then-search | ✅ 1/1 (100%) | ❌ 0/1 (0%) |
+| find the invoice PDF on my computer | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| food decision \u2192 fetchMeals | 🔸 1/1 XFAIL | ✅ 1/1 (100%) |
+| jacket \u2192 getWeather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| location weather query selects getWeather and few others | ✅ 1/1 (100%) | ❌ 0/1 (0%) |
+| log that I just ate a banana | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| meal logging selects logMeal and few others | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| meal recall (colloquial) \u2192 fetchMeals | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| meal recall selects fetchMeals and few others | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| news-interesting-for-me | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| news-of-interest-to-me | ✅ 1/1 (100%) | ❌ 0/1 (0%) |
+| news-that-would-interest-me | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| recommend a book I'd like | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| research \u2192 webSearch + fetchWebPage | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| run forecast \u2192 getWeather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| search the web for flight deals | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| suggest something I'd enjoy watching ton | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| take a screenshot | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| tell me some news that might interest me | ✅ 1/1 (100%) | ❌ 0/1 (0%) |
+| warm-memory-short-query-how's the weather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| weather + meals | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| weather query selects getWeather and few others | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| web search query selects webSearch and few others | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| weekly weather keeps getWeather | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| what is the capital of France | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| what should I cook for dinner | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| what's 2 plus 2 | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| what's on my screen right now? | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| what's the weather like? | ✅ 1/1 (100%) | ✅ 1/1 (100%) |
+| who is Britney Spears | ❌ 0/1 (0%) | ✅ 1/1 (100%) |
+
+---
+
+## 🎤 Intent judge
+
+> Pinned to `gemma4:e2b` (the voice intent classifier). Not affected by the judge model. Re-run on 2026-05-04 with the prompt fix in this PR; cells repped 5× where they sit on the small-model edge.
+
+**Notes:**
+- `cross_segment_answer_that_with_noise` regressed between `main` and `develop` (introduced by `a8f133c`'s "big Mac" few-shot example, which biased the small model toward preserving user text instead of resolving cross-segment imperatives). Two contrasting examples added in this PR — one for prior-question-with-noise, one for the multi-word "go ahead and answer" imperative — restore both this case and `multi_person_weather_discussion` and `cross_segment_go_ahead_and_answer` (each 5/5).
+- New case `wake_word_trailing_after_capitalised_brand` (added in `a8f133c`) covers the original "big Mac" regression and is preserved by the fix.
+- The three edge cases were each repped 5× during the prompt iteration to confirm stability; recorded as 1/1 here for consistency with the rest of the table.
+
+| Test Case | Pass Rate | Status |
+|-----------|-----------|:------:|
+| Hot window mode indicated in prompt | 1/1 (100%) | ✅ |
+| Old query not re extracted | 1/1 (100%) | ✅ |
+| Processed segment not reextracted | 1/1 (100%) | ✅ |
+| Returns none when ollama unavailable | 1/1 (100%) | ✅ |
+| System prompt has echo guidance | 1/1 (100%) | ✅ |
+| Tts text included for echo detection | 1/1 (100%) | ✅ |
+| alias_after_narrative_context | 1/1 (100%) | ✅ |
+| alias_treated_as_wake_word | 1/1 (100%) | ✅ |
+| buffer_echo_then_followup_hot_window | 1/1 (100%) | ✅ |
+| buried_target_amid_unrelated_chatter | 1/1 (100%) | ✅ |
+| buried_target_plural_vague_ref_they | 1/1 (100%) | ✅ |
+| buried_target_topicless_question | 1/1 (100%) | ✅ |
+| context_synthesis_weather_opinion | 1/1 (100%) | ✅ |
+| context_synthesis_with_prior_ambient | 1/1 (100%) | ✅ |
+| cross_segment_answer_that_weather | 1/1 (100%) | ✅ |
+| cross_segment_answer_that_with_noise | 1/1 (100%) | ✅ |
+| cross_segment_answered_that_whisper_variant | 1/1 (100%) | ✅ |
+| cross_segment_dinosaur_opinion | 1/1 (100%) | ✅ |
+| cross_segment_go_ahead_and_answer | 1/1 (100%) | ✅ |
+| cross_segment_hot_window_followup | 1/1 (100%) | ✅ |
+| cross_segment_imperative_superseded_by_new_question | 1/1 (100%) | ✅ |
+| echo_plus_followup_extracted | 1/1 (100%) | ✅ |
+| echo_plus_rejected_similar_plus_wake_retry | 1/1 (100%) | ✅ |
+| hot_window_override_topicless_followup | 1/1 (100%) | ✅ |
+| hot_window_simple_followup | 1/1 (100%) | ✅ |
+| mentioned_in_narrative_past_tense | 1/1 (100%) | ✅ |
+| multi_person_vague_reference | 1/1 (100%) | ✅ |
+| multi_person_weather_discussion | 1/1 (100%) | ✅ |
+| multiple_echoes_then_interrupt | 1/1 (100%) | ✅ |
+| no_wake_word_casual_speech | 1/1 (100%) | ✅ |
+| no_wake_word_in_buffer | 1/1 (100%) | ✅ |
+| stop_command_during_tts | 1/1 (100%) | ✅ |
+| user_followup_statement_after_question_nihilism | 1/1 (100%) | ✅ |
+| wake_word_after_narrative_addresses_assistant | 1/1 (100%) | ✅ |
+| wake_word_command_timer | 1/1 (100%) | ✅ |
+| wake_word_mid_sentence | 1/1 (100%) | ✅ |
+| wake_word_open_imperative_give_me_advice | 1/1 (100%) | ✅ |
+| wake_word_open_imperative_say_something | 1/1 (100%) | ✅ |
+| wake_word_open_imperative_surprise_me | 1/1 (100%) | ✅ |
+| wake_word_open_imperative_tell_me_a_joke | 1/1 (100%) | ✅ |
+| wake_word_open_imperative_tell_me_anything | 1/1 (100%) | ✅ |
+| wake_word_share_statement_burger | 1/1 (100%) | ✅ |
+| wake_word_share_statement_feeling | 1/1 (100%) | ✅ |
+| wake_word_share_statement_trailing | 1/1 (100%) | ✅ |
+| wake_word_simple_question | 1/1 (100%) | ✅ |
+| wake_word_statement_remember | 1/1 (100%) | ✅ |
+| wake_word_trailing_after_capitalised_brand | 1/1 (100%) | ✅ |
+| wake_word_trailing_after_named_entity | 1/1 (100%) | ✅ |
+
+---
+
+## 🧠 Memory merge consolidation
+
+> Exercises `merge_node_data` against a real picker model. Pins the rewrite-on-write merge against its five advertised behaviours: dedupe of near-duplicates, pattern consolidation of repeated activities, independence (unrelated facts coexist, no silent erasure), meta-narrative pruning (assistant-narrating extractor leftovers get scrubbed), and end-to-end correctness of the batched signature. Run via `pytest evals/test_merge_consolidation.py`.
+
+| Test Case | Pass Rate | Status |
+|-----------|-----------|:------:|
+| Dedupe — same fact, different wording (lives-in vs based-in London) | 1/1 (100%) | ✅ |
+| Dedupe — job title rephrased | 1/1 (100%) | ✅ |
+| Pattern — repeated sushi meals fold into "regularly eats sushi" | 1/1 (100%) | ✅ |
+| Pattern boundary — distinct one-off dated events stay distinct | 1/1 (100%) | ✅ |
+| Independence — peanut allergy + tea preference survive unrelated hiking fact | 1/1 (100%) | ✅ |
+| Independence — software-engineer job survives unrelated guitar fact | 1/1 (100%) | ✅ |
+| Meta-narrative — capability-denial line dropped, real directive kept | 1/1 (100%) | ✅ |
+| Meta-narrative — assistant-suggested line dropped, factual lookup survives | 1/1 (100%) | ✅ |
+| Meta-narrative — polluted node receiving new fact: drop + incorporate | 1/1 (100%) | ✅ |
+| Meta-narrative — clean directives node not over-pruned | 1/1 (100%) | ✅ |
+| Batched merge — three independent new facts in one call all land | 1/1 (100%) | ✅ |
+
+**Notes:** the pattern-boundary case was previously `xfail(strict=False)` because `gemma4:e2b` clustered dated entries and silently dropped older ones. After the META-NARRATIVE rule landed it now passes 3/3 reps; the causal link is unconfirmed but the eval is the right place to catch a regression, so the marker is dropped and the case stands as a regular PASS.
+
+---
+
+## 🔄 KV-cache prompt restructure: regression comparison (2026-08-03)
+
+> Verification run for commit `0edfbc3` ("perf: restructure LLM prompts for maximum KV-cache prefix reuse"), which moved the reply loop's live `[Context: ...]` block from the head of the system message to the end of its dynamic region (computed once per reply), made the memory-enrichment extractor's system prompt byte-static, reordered the tool router's user prompt to put the static catalogue before the dynamic hint, and set `cache_prompt: true` on all Ollama payloads. The prompt restructure must not change agent behaviour, so the affected eval files were run **before and after** the change on the same server and compared failure-set-by-failure-set.
+
+**Setup:** `EVAL_JUDGE_BASE_URL=http://localhost:1234 EVAL_JUDGE_MODEL=google/gemma-4-e2b` (LM Studio, OpenAI-compatible endpoint), which is **not** the canonical Ollama `gemma4:e2b` used by the tables above, so absolute pass counts are not comparable across sections; this run is a base-vs-change comparison only. No retries, plain `pytest` run.
+
+| File set | Base (pre-change) | With change (final layout) |
+|----------|------------------:|---------------------------:|
+| Router + multi-turn + greeting + planner (6 files: `test_tool_router_implicit`, `test_tool_router_context_aware`, `test_multi_turn_context`, `test_greeting_no_tools`, `test_planner_personalisation`, `test_planner_trivial_with_tools`) | 12 passed / 38 failed | 12 passed / 38 failed |
+| `test_agent_behavior.py::TestMemoryEnrichment` (extractor prompt change) | 6 failed | 6 failed |
+
+**Result:** ✅ No regression. The sorted `FAILED` lists are byte-identical between base and the change for both file sets. All 38 failures are pre-existing model-behaviour issues of the `google/gemma-4-e2b` / LM Studio combination (router and planner misroutes, gemma-native tool-fence emissions) that also occur on base.
+
+**Notes:**
+- One intermediate layout (context line appended *after* the text-tool syntax guidance) produced a single extra failure on `test_multi_turn_context.py::TestTopicSwitching::test_search_then_weather` (the model emitted the forbidden gemma-native `<|tool_call|>` fence instead of the JSON literal). It passed 3/3 in isolation, and the final layout (context inserted *before* the tool-call syntax guidance, keeping the instruction block final for small models) restored the exact base failure set. The same fence-emission failure mode appears on base in other tests, so it is ambient small-model variance rather than a prompt-placement effect.
+- The unit-level KV-cache assertions (byte-identical system message across in-loop calls, once-per-reply context fetch, context at the tail) live in `tests/test_engine_kv_cache.py`; the full unit suite showed no regressions (99 pre-existing environment failures, identical before and after).
+
+---
+
+### 📖 Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| ✅ | Fully passed (100% pass rate) |
+| ⚠️ | Partial pass (some runs failed) |
+| ❌ | Fully failed (0% pass rate) |
+| ⏭️ | Skipped (missing dependencies) |
+| 🔸 | Expected failure (known limitation) |
+| 🎉 | Unexpectedly passed (bug fixed!) |
+| ➖ | Not run for this model |
+
+## Hybrid diary retrieval (offline ranking regression)
+
+`evals/test_hybrid_retrieval.py` uses 24 synthetic summaries, nine keyword queries
+and nine paraphrases with controlled embeddings. This measures fusion correctness,
+not embedding-model quality or general real-world recall.
+
+| Retrieval | Lexical recall@3 | Semantic recall@3 |
+|-----------|------------------|-------------------|
+| FTS-only | 9/9 | 0/9 |
+| Baseline hybrid (d1b4c76) | 0/9 | 9/9 |
+| Weighted reciprocal rank fusion | 9/9 | 9/9 |
+
+Run: `PYTHONPATH=src pytest evals/test_hybrid_retrieval.py -q -s`.
+Separate regression tests cover equal-distance keyword matches, missing-source
+candidates and the native sqlite-vss query path when the extension is installed.
+
+*Report generated by Jarvis eval suite*
